@@ -222,7 +222,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-Rivals2/*
+Engine
+Engine/*
 Rivals2
+Rivals2/*
 Rivals2*.zip
 Rivals2*.pak
+*.json
