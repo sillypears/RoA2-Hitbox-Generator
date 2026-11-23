@@ -1,0 +1,2 @@
+cue4parse>=0.0.9
+pillow>=13.0.0
