@@ -29,13 +29,14 @@ Use FModel's **Save/Export Properties** action (or its **Export Session** in bui
 
 The renderer reads attack window and hitbox data from the `ATT_*.json`, capsule/sphere hurtbox data from `HB_*.json`, and bone reference transforms from the skeleton JSON. Keep the original package names and folder structure so animation references can be matched.
 
-### Asset/Animations as UEFormat
+### Raw assets and animations
 
-Export the character's move animations in **UEFormat** format, which creates `.uasset` and `.ueanim` filesKeep them under the same character folder; the exact subfolder can follow FModel's exported path. 
+Export raw package files and UEFormat animations as separate export types. Raw data supplies `.uasset`/`.uexp` files; the animation export supplies `.ueanim` files. Keep them under the same character folder and preserve FModel's directory structure.
 
-- Right click on the `Characters` folder and under `Export Folder` select the following:
-  - **Raw Data (.uasset)**
-  - **Animations**
+- Right-click the `Characters` folder and under **Export Folder** select:
+  - **Raw Data (.uasset)** for the raw package files.
+  - **Animations** for the animation files.
+- In FModel's settings, set **Models → Mesh Format** to **UEFormat** so the animation export uses UEFormat.
 
 For example:
 
@@ -48,7 +49,7 @@ Rivals2/Content/Characters/Loxodont/
     └── Attacks/AN_Lox_BAir.ueanim
 ```
 
-The UEFormat model exporter supports `.uemodel` and `.ueanim`; the frame renderer specifically needs the `.ueanim` files, not `.uasset`/`.uexp` copies. See the [UEFormat format and Unreal plugin repository](https://github.com/h4lfheart/UEFormat).
+UEFormat model and animation exports use `.uemodel` and `.ueanim`; the frame renderer specifically needs `.ueanim` files for animated poses. Raw `.uasset`/`.uexp` copies do not replace them. See the [UEFormat format and Unreal plugin repository](https://github.com/h4lfheart/UEFormat).
 
 Example:
 
@@ -67,7 +68,7 @@ Activate the virtual environment
 ### Windows
 
 ```powershell
-.venv/bin/activate.ps1
+.\.venv\Scripts\activate.ps1
 ```
 
 ### Linux (bash/fish)
@@ -152,7 +153,7 @@ python make_attack_gif.py Rivals2/HitboxFrames/Loxodont/ATT_Lox_Bair_Grounded \
   --out Rivals2/GIFs/Loxodont/ATT_Lox_Bair_Grounded.gif --no-dither
 ```
 
-`make_attack_gif.py` accepts both the newer descriptive `*_HB_####.png` names and legacy `frame_####.png` names. GIF transparency supports only fully transparent or fully opaque pixels; APNG and WebM output can preserve partial alpha:
+`make_attack_gif.py` accepts both the newer descriptive `*_HB_####.png` names and legacy `frame_####.png` names. GIF transparency supports only fully transparent or fully opaque pixels; APNG and WebM output can preserve partial alpha. WebM export requires `ffmpeg` installed and available on `PATH`:
 
 ```bash
 python make_attack_gif.py Rivals2/HitboxFrames/Loxodont/ATT_Lox_Bair_Grounded --format apng
