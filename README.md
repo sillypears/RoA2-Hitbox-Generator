@@ -2,6 +2,12 @@
 
 This project reads FModel exports for Rivals 2, builds a per-frame representation of attack and hurt boxes, renders transparent PNGs, and then stitches each move into a GIF (or webm/apng). It can also render a character mesh exported as GLB beneath the boxes.
 
+## **DISCLAIMER**
+
+Yes, I had AI help me work thru a lot of the data aggregation, so I could get this project completed in a week instead of what would likely take me months. If you disagree, you can leave lodge your discontent in issues and I will reply to them.
+
+___
+
 The expected inputs are:
 
 - FModel property JSON for the attack assets (`ATT_*.json`), the character's body physics asset (`HB_*.json`), and the main skeleton (`Animation/*Skeleton.json`).
