@@ -8,6 +8,8 @@ The expected inputs are:
 - A matching UEFormat animation file (`.ueanim`) for each move animation. Without it, the renderer uses the skeleton reference pose and marks that output as a fallback.
 - Optional GLB character meshes under `Skins/Default/`, exported from FModel with **Models → Mesh Format → glTF 2.0**. The overlay option requires this per character.
 
+![Hit/Hurt Box Legend](images/box_legend.png)
+
 ## 1. Configure FModel and the `.usmap`
 
 1. In FModel, select the Rivals 2 archive directory (the directory containing its `.pak` archive, `Rivals2/Content/Paks/`) and the game's Unreal version. The scripts use `GAME_UE5_8` for CUE4Parse exports and this should be auto-selected by FModel.
@@ -109,12 +111,16 @@ Render just one character or move:
 ```bash
 python rivals2_move_boxes.py --character Loxodont
 python rivals2_move_boxes.py --character Loxodont --move ATT_Lox_Bair
-python rivals2_move_boxes.py --character Loxodont --move ATT_Lox_Bair --hide-skeleton
+python rivals2_move_boxes.py --character Loxodont --move ATT_Lox_Bair --show-skeleton
 python rivals2_move_boxes.py --character Loxodont --move ATT_Lox_Bair --show-character
 python rivals2_move_boxes.py --character Loxodont --move ATT_Lox_Bair --skin-textures
 ```
 
-`--show-character` looks for `Skins/Default/SK_*_Default.glb`, applies the matching `.ueanim` pose, and draws the mesh behind the skeleton and boxes. `--skin-textures` (also accepted as `--skin-texture`) bakes the exported color-region masks, resolves the skin palette through its `CS_*.json` to the referenced `PS_*.json`, and applies each material's exported normal map with basic banded lighting; it implies `--show-character`. This does not reproduce the game's full custom toon shader or outlines. With the mesh enabled, the camera rotates 90° clockwise around the character; the boxes use the same projection so they remain aligned. Use `--camera-rotation 0` for the original side view, or pass another angle in degrees. Without either mesh flag, the existing side view remains the default. Export the default skeletal mesh to GLB for each character you want to use with these options.
+`--show-character` looks for `Skins/Default/SK_*_Default.glb`, applies the matching `.ueanim` pose, and draws the mesh behind the skeleton and boxes. `--skin-textures` (also accepted as `--skin-texture`) bakes the exported color-region masks, resolves the skin palette through its `CS_*.json` to the referenced `PS_*.json`, and applies each material's exported normal map with basic banded lighting; it implies `--show-character`. This does not reproduce the game's full custom toon shader or outlines. Export the default skeletal mesh to GLB for each character you want to use with these options.
+
+`--camera-rotation DEGREES` rotates the view clockwise around the character. The default, `90`, looks at the gameplay plane (forward/back across the image, up/down vertically), with or without the mesh. Every layer uses the same projection, so mesh, skeleton, hurtboxes, and hitboxes stay aligned. `0` was the old box-only default; it looks along the game's depth axis, so forward-reaching hitboxes appear on top of the character.
+
+The animated skeleton is hidden by default; `--show-skeleton` draws it.
 
 By default, outputs go to `Rivals2/HitboxFrames/<Character>/`. Each attack animation variant gets a folder, such as `ATT_Lox_Bair_Grounded/`. PNGs use a descriptive filename that includes game, character, attack asset, variant, and 1-based frame number:
 
@@ -126,7 +132,63 @@ RoA2_Loxodont_ATT_Lox_Bair_Grounded_HB_0002.png
 Each move folder also contains:
 
 - `boxes.json` — frame-by-frame box positions and metadata.
-- `info.json` and `info.md` — available move stats and active hitbox windows to mirror the [Brawl style output](https://rukaidata.com/P+/Ice%20Climbers/subactions/AttackAirF.html)
+- `info.json` and `info.md` — available move stats, active hitbox windows, and the frames where the move changes hurtbox states, to mirror the [Brawl style output](https://rukaidata.com/P+/Ice%20Climbers/subactions/AttackAirF.html)
+
+### Box colors and states
+
+![Box color legend](images/box_legend.png)
+
+Hitboxes (the attack) are drawn on top of hurtboxes (the character's body). Each box gets a translucent fill and a solid outline. Overlapping boxes stack, so overlaps look more solid.
+
+#### Hitboxes
+
+The color comes from the hitbox's `HitResponse` in `Attacks/ATT_*.json`. For ordinary `Hit` boxes, a "sweet" or "sour" label in the hitbox or damage-property name picks the sweet/sour color.
+
+| Legend | Data value | Meaning |
+|---|---|---|
+| Hit | `HitResponse: Hit` | A normal damaging hitbox with no sweet/sour label. |
+| Sweetspot | `Hit`, name contains `sweet` | The strongest part of a move, usually more damage or knockback. |
+| Sourspot | `Hit`, name contains `sour` | The weaker part of a move. |
+| Grab | `HitResponse: Grab` | Grabs the opponent instead of hitting: standard grabs, dash/pivot grabs, and command grabs. Ungrabbable hurtboxes ignore it. |
+| Hit grab | `HitResponse: HitGrab` | A hit that becomes a grab on contact. Unhitgrabbable hurtboxes ignore it. |
+| Detect | `HitResponse: Detect` / `DetectAll` | Checks for contact without dealing damage, e.g. to trigger a follow-up or counter. |
+| Kills projectiles | `HitResponse: KillProjectiles` | Only destroys projectiles; does not hit fighters. |
+
+Sweet/sour detection relies on naming, because the game data has no separate sweet/sour field.
+
+#### Hurtboxes
+
+A hurtbox is where the character can be hit. There are three sources:
+
+1. **Body capsules** from the character's physics asset (`HB_*.json`, which `CD_*.json` points to).
+2. **`CD_<Character>.json` → `HurtboxDefinitions`.** These either set a body capsule's default state (for example, many characters' elbows and knees are `Ungrabbable` by default) or add extra spheres/capsules for specific moves. Loxodont's `Fspecial Hurtbox` is one; extra hurtboxes stay off until a move turns them on.
+3. **`ATT_*.json` → `Windows[].HurtboxStateChanges`.** These change states during a move. A blank or `None` hurtbox name means all hurtboxes. Setting a state to `Default` returns each hurtbox to its own default from step 2.
+
+| Legend | `ERivalsHurtboxState` | Meaning |
+|---|---|---|
+| Normal (Default / Vulnerable) | `Default`, `Vulnerable` | Normal: can be hit and grabbed. Moves use both names when turning hurtboxes back to normal. |
+| Ungrabbable | `Ungrabbable` | Can be hit but not grabbed. Common on limbs by default and on the whole body while holding a grab. |
+| Unhitgrabbable | `Unhitgrabbable` | Can be hit, but hit-grabs (Hit grab hitboxes) don't connect. |
+| Intangible | `Intangible` | Attacks pass through without touching. Getup and ledge options use this. |
+| Projectile intangible | `ProjectileIntangible` | Intangible to projectiles only; melee attacks still connect. |
+| Invulnerable | `Invulnerable` | Attacks connect but the character takes no damage or knockback. |
+| Countering | `Countering` | Being hit triggers the character's counter. |
+| Parrying | `Parrying` | Being hit triggers a parry. |
+| Inactive | `Inactive` | Switched to an inactive state by the move (for example while traveling or hidden); treat as not hittable. |
+| Disabled | `HurtboxActive: false` | The hurtbox is turned off entirely. Hidden by default; set `HURTBOX_SHOW_DISABLED = True` to draw it. |
+
+The meanings come from the state names and how moves use them. The game files have no descriptions, so treat the states marked * in the legend image (`Invulnerable`, `Countering`, `Parrying`, `Inactive`) as best interpretations. The legend image is drawn by `make_legend.py`: its colors and styling come from `rivals2_move_boxes.py`, and its explanations are the `LEGEND_ENTRIES` list in `make_legend.py`. Keep that list and these tables in step.
+
+The physics asset also has a `CollisionEnabled` flag (`QueryAndPhysics` / `NoCollision`). That is Unreal's physics setting, not a gameplay state: on Loxodont, the left limbs are `QueryAndPhysics` and the right limbs are `NoCollision`. It is saved in `boxes.json` for reference but does not affect colors.
+
+#### Changing colors
+
+All colors and opacities are named settings near the top of `rivals2_move_boxes.py`: `HITBOX_FILL_COLOR_*`, `HURTBOX_FILL_COLOR_*`, `HITBOX_FILL_ALPHA`, `HURTBOX_FILL_ALPHA`, and the outline settings. Colors are `(R, G, B)` tuples. Alpha runs from 0 (invisible) to 255 (solid): 50% is 128, 80% is 204. The GIF converter and `make_legend.py` read the same settings. After changing colors or legend text, regenerate the legend image:
+
+```bash
+python make_legend.py                      # writes images/box_legend.png
+python make_legend.py --out /tmp/legend.png   # or write it somewhere else
+```
 
 To change the output root, pass `--out`. With `--all`, the character name is added below that root:
 

@@ -77,14 +77,14 @@ def gif_alpha(image, dither=True, matte_color=None):
 
 def indexed_frames(images):
     """Use one move-wide palette and reserve colors that identify box classes."""
-    reserved = [
-        (0, 150, 255), (0, 220, 255),       # active hurtbox fill/outline
-        (15, 55, 115), (45, 105, 180),      # NoCollision hurtbox fill/outline
-        (235, 240, 245),                    # skeleton
-        (213, 0, 249),                      # sweetspot
-        (255, 176, 0),                      # sourspot
-        (255, 23, 68),                      # other hitbox
-    ]
+    try:
+        # Single source of truth: the color settings at the top of the
+        # frame renderer.
+        from rivals2_move_boxes import semantic_colors
+        reserved = semantic_colors()
+    except ImportError:
+        reserved = [(0, 150, 255), (235, 240, 245), (213, 0, 249),
+                    (255, 176, 0), (255, 23, 68)]
     frequencies = Counter()
     for rgba in images:
         for count, color in rgba.getcolors(maxcolors=1_000_000) or []:

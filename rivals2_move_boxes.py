@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 
 try:
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageChops, ImageDraw, ImageFilter
 except ImportError as exc:
     raise SystemExit("PNG rendering requires Pillow: python -m pip install pillow") from exc
 
@@ -36,6 +36,7 @@ ROOT = Path(__file__).resolve().parent
 CHAR = ROOT / "Rivals2/Content/Characters/Loxodont"
 ATTACKS = CHAR / "Attacks"
 PHYSICS = CHAR / "HB_Lox.json"
+CHARACTER_DATA = CHAR / "CD_Loxodont.json"   # hurtbox definitions and physics asset
 SKELETON = CHAR / "Animation/SK_Lox_Skeleton.json"
 OUT_DEFAULT = ROOT / "Rivals2/HitboxFrames/Loxodont"
 CHARACTERS_ROOT = ROOT / "Rivals2/Content/Characters"
@@ -44,6 +45,106 @@ WIDTH, HEIGHT = 900, 680
 SCALE = 1.8
 VIEW_CENTER_Z = 95
 REFERENCE_WARNING = "REFERENCE POSE ONLY — matching .ueanim not found"
+# FModel glTF axes: GLB (X, Y, Z) = Unreal (X, Z, Y), in meters instead of cm.
+UE_TO_GLTF_BASIS = np.array([[1, 0, 0], [0, 0, 1], [0, 1, 0]], dtype=np.float32)
+
+# ---------------------------------------------------------------------------
+# Box styling. Colors are (R, G, B) with 0-255 channels; opacity is separate.
+# Alpha is 0 (invisible) to 255 (solid): 50% = 128, 80% = 204, 90% = 230.
+# ---------------------------------------------------------------------------
+HITBOX_FILL_ALPHA = 150             # hitbox interior
+HITBOX_OUTLINE_ALPHA = 255          # hitbox outline
+HITBOX_OUTLINE_WIDTH = 3            # px
+
+# Hitboxes are chosen by the attack's HitResponse first, then by a sweet/sour
+# label in the hitbox or damage-property name.
+HITBOX_FILL_COLOR_NORMAL = (237, 56, 92)       # Hit, no sweet/sour label
+HITBOX_FILL_COLOR_SWEET = (213, 0, 249)        # Hit, name contains "sweet"
+HITBOX_FILL_COLOR_SOUR = (255, 176, 0)         # Hit, name contains "sour"
+HITBOX_FILL_COLOR_GRAB = (153, 0, 255)        # Grab: standard and command grabs
+HITBOX_FILL_COLOR_HITGRAB = (255, 0, 200)      # HitGrab: grabs on hit
+HITBOX_FILL_COLOR_DETECT = (164, 121, 20)      # Detect/DetectAll: triggers, no damage
+HITBOX_FILL_COLOR_KILL_PROJECTILES = (141, 110, 99)  # KillProjectiles: destroys projectiles only
+
+HURTBOX_FILL_ALPHA = 80            # hurtbox interior; overlaps stack
+HURTBOX_OUTLINE_ALPHA = 160         # hurtbox outline (drawn in a lighter tint)
+HURTBOX_OUTLINE_WIDTH = 2           # px
+HURTBOX_OUTLINE_LIGHTEN = 0.45      # 0 = outline same as fill, 1 = white
+HURTBOX_SHOW_DISABLED = False       # draw hurtboxes switched off (HurtboxActive false)?
+
+# Hurtbox gameplay states (ERivalsHurtboxState). Each hurtbox starts in its
+# default state from CD_<Char>.json HurtboxDefinitions (else Default) and
+# moves change it with Windows[].HurtboxStateChanges in ATT_*.json.
+HURTBOX_FILL_COLOR_DEFAULT = (66, 255, 37)              # normal: hittable and grabbable
+HURTBOX_FILL_COLOR_VULNERABLE = (0, 150, 255)           # explicit normal; used like Default
+HURTBOX_FILL_COLOR_UNGRABBABLE = (244, 255, 41)          # hittable, cannot be grabbed
+HURTBOX_FILL_COLOR_UNHITGRABBABLE = (0, 255, 242)       # hittable, immune to hit-grabs
+HURTBOX_FILL_COLOR_INTANGIBLE = (190, 190, 205)         # passes through hits
+HURTBOX_FILL_COLOR_PROJECTILE_INTANGIBLE = (0, 79, 163)  # intangible to projectiles only
+HURTBOX_FILL_COLOR_INVULNERABLE = (28, 255, 145)         # gets hit but takes nothing
+HURTBOX_FILL_COLOR_COUNTERING = (255, 120, 40)          # hit triggers a counter
+HURTBOX_FILL_COLOR_PARRYING = (115, 255, 0)           # hit triggers a parry
+HURTBOX_FILL_COLOR_INACTIVE = (70, 70, 80)              # state Inactive
+HURTBOX_FILL_COLOR_DISABLED = (40, 40, 40)              # HurtboxActive false (see HURTBOX_SHOW_DISABLED)
+
+HURTBOX_STATE_COLORS = {
+    "Default": HURTBOX_FILL_COLOR_DEFAULT,
+    "Vulnerable": HURTBOX_FILL_COLOR_VULNERABLE,
+    "Ungrabbable": HURTBOX_FILL_COLOR_UNGRABBABLE,
+    "Unhitgrabbable": HURTBOX_FILL_COLOR_UNHITGRABBABLE,
+    "Intangible": HURTBOX_FILL_COLOR_INTANGIBLE,
+    "ProjectileIntangible": HURTBOX_FILL_COLOR_PROJECTILE_INTANGIBLE,
+    "Invulnerable": HURTBOX_FILL_COLOR_INVULNERABLE,
+    "Countering": HURTBOX_FILL_COLOR_COUNTERING,
+    "Parrying": HURTBOX_FILL_COLOR_PARRYING,
+    "Inactive": HURTBOX_FILL_COLOR_INACTIVE,
+}
+SKELETON_COLOR = (235, 240, 245)
+SKELETON_ALPHA = 128
+
+def gltf_to_ue_cm(vertices):
+    """Return Unreal (X, Y, Z) centimeter components of GLB-space vertices."""
+    return vertices[..., 0] * 100, vertices[..., 2] * 100, vertices[..., 1] * 100
+
+
+def short_enum(value, default=""):
+    """'ERivalsHurtboxState::Intangible' -> 'Intangible'."""
+    return str(value).split("::")[-1] if value is not None else default
+
+
+def hitbox_color(box):
+    """Pick a hitbox color from its HitResponse, then its sweet/sour label."""
+    response = short_enum(box.get("hit_response")).casefold()
+    if response == "hitgrab":
+        return HITBOX_FILL_COLOR_HITGRAB
+    if response == "grab":
+        return HITBOX_FILL_COLOR_GRAB
+    if response in ("detect", "detectall"):
+        return HITBOX_FILL_COLOR_DETECT
+    if response == "killprojectiles":
+        return HITBOX_FILL_COLOR_KILL_PROJECTILES
+    return {"sweet": HITBOX_FILL_COLOR_SWEET,
+            "sour": HITBOX_FILL_COLOR_SOUR}.get(box.get("spot"), HITBOX_FILL_COLOR_NORMAL)
+
+
+def hurtbox_color(box):
+    if not box.get("active", True):
+        return HURTBOX_FILL_COLOR_DISABLED
+    return HURTBOX_STATE_COLORS.get(box.get("state", "Default"), HURTBOX_FILL_COLOR_DEFAULT)
+
+
+def hurtbox_outline_color(fill):
+    """Hurtbox outlines are the fill tinted toward white by HURTBOX_OUTLINE_LIGHTEN."""
+    return tuple(round(c + (255 - c) * HURTBOX_OUTLINE_LIGHTEN) for c in fill)
+
+
+def semantic_colors():
+    """Every configured box color, for GIF palette reservation."""
+    hit = [HITBOX_FILL_COLOR_NORMAL, HITBOX_FILL_COLOR_SWEET, HITBOX_FILL_COLOR_SOUR,
+           HITBOX_FILL_COLOR_GRAB, HITBOX_FILL_COLOR_HITGRAB, HITBOX_FILL_COLOR_DETECT,
+           HITBOX_FILL_COLOR_KILL_PROJECTILES]
+    return list(dict.fromkeys([*hit, *HURTBOX_STATE_COLORS.values(),
+                               HURTBOX_FILL_COLOR_DISABLED, SKELETON_COLOR]))
 
 
 class BinaryReader:
@@ -401,18 +502,24 @@ class GLBCharacter:
 
     @staticmethod
     def ue_world_to_gltf(position, rotation):
-        """Convert Unreal cm coordinates (X forward, Z up) to GLB meters."""
+        """Convert Unreal cm coordinates (left-handed, Z up) to GLB meters.
+
+        FModel's glTF export swaps Unreal Y and Z (GLB = UE X, UE Z, UE Y).
+        That swap is a reflection, which is what converts Unreal's
+        left-handed basis to glTF's right-handed one. A cyclic permutation
+        (no reflection) mirrors the posed skeleton against the mesh: centered
+        bones still line up, but left/right bones trade sides and asymmetric
+        parts such as the axe head fold onto themselves.
+        """
         x, y, z, w = rotation
         ue_rotation = np.array([
             [1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)],
             [2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)],
             [2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)],
         ], dtype=np.float32)
-        # GLB basis = (Unreal Y, Unreal Z, Unreal X), a cyclic permutation.
-        basis = np.array([[0, 1, 0], [0, 0, 1], [1, 0, 0]], dtype=np.float32)
         result = np.eye(4, dtype=np.float32)
-        result[:3, :3] = basis @ ue_rotation @ basis.T
-        result[:3, 3] = (position[1] * .01, position[2] * .01, position[0] * .01)
+        result[:3, :3] = UE_TO_GLTF_BASIS @ ue_rotation @ UE_TO_GLTF_BASIS.T
+        result[:3, 3] = (position[0] * .01, position[2] * .01, position[1] * .01)
         return result
 
     def posed_primitives(self, world_pose):
@@ -515,10 +622,16 @@ def animation_local_pose(animation, ref_local, indices, frame):
 
 
 def bone_point(bones, indices, bone_name, offset=(0, 0, 0)):
-    # Rivals attack data refers to the character root as "Root"; the exported
-    # Loxodont skeleton uses Unreal's actual bone name "Root_M".
+    # Attack data uses "Root" for the character origin, not a skeleton bone:
+    # no exported skeleton has a bone with that name. Its offsets are in
+    # gameplay axes (X forward, Z up; Y is almost always 0). The skeleton's
+    # top bone "Group" is that origin: at the feet with identity rotation in
+    # every animation. "Root_M" is the pelvis control, ~1 m up with a rotated
+    # frame, and would turn vertical offsets sideways.
     if bone_name == "Root" and bone_name not in indices:
-        bone_name = "Root_M"
+        if "Group" not in indices:
+            return tuple(float(v) for v in offset)
+        bone_name = "Group"
     idx = indices.get(bone_name)
     if idx is None:
         return None
@@ -528,21 +641,115 @@ def bone_point(bones, indices, bone_name, offset=(0, 0, 0)):
     return tuple(t[k] + r[k] for k in range(3))
 
 
-def hurt_shapes(bones, indices):
-    if not PHYSICS or not PHYSICS.is_file():
-        return []
-    data = json.loads(PHYSICS.read_text(encoding="utf-8"))
-    shapes = []
-    for entry in data:
-        if entry.get("Type") != "SkeletalBodySetup":
-            continue
+@functools.lru_cache(maxsize=32)
+def load_physics_bodies(path_string):
+    """Parse a PhysicsAsset JSON once: [(bone name, AggGeom dict), ...]."""
+    path = Path(path_string)
+    if not path.is_file():
+        return ()
+    bodies = []
+    for entry in json.loads(path.read_text(encoding="utf-8")):
+        if entry.get("Type") == "SkeletalBodySetup":
+            props = entry.get("Properties", {})
+            bodies.append((props.get("BoneName", ""), props.get("AggGeom", {})))
+    return tuple(bodies)
+
+
+@functools.lru_cache(maxsize=32)
+def load_character_data(path_string):
+    """Return the CD_<Char>.json properties holding hurtbox setup, or {}."""
+    path = Path(path_string)
+    if not path.is_file():
+        return {}
+    for entry in json.loads(path.read_text(encoding="utf-8")):
         props = entry.get("Properties", {})
-        bone = props.get("BoneName", "")
+        if "HurtboxDefinitions" in props or "HurtboxesPhysicsAsset" in props:
+            return props
+    return {}
+
+
+def hurtbox_definitions():
+    """HurtboxDefinitions from the character data asset, keyed by name.
+
+    "Existing" entries override a physics-asset body's default state/active
+    flag. "NewSphere"/"NewCapsule" entries add hurtboxes positioned from the
+    character origin (gameplay axes: X forward, Z up); temporary ones start
+    disabled until a move's HurtboxStateChanges enables them by name.
+    """
+    data = load_character_data(str(CHARACTER_DATA)) if CHARACTER_DATA else {}
+    definitions = {}
+    for entry in data.get("HurtboxDefinitions", []) or []:
+        name = entry.get("HurtboxName", "")
+        if name:
+            definitions[name] = {
+                "type": short_enum(entry.get("HurtboxDefinitionType"), "Existing"),
+                "state": short_enum(entry.get("HurtboxDefaultState"), "Default"),
+                "active": bool(entry.get("HurtboxActive", True)),
+                "temporary": bool(entry.get("bIsTemporary", False)),
+                "a": vec(entry.get("OffsetFromOrigin", {})),
+                "b": vec(entry.get("OffsetFromOrigin2", {})),
+                "r": float(entry.get("HurtboxRadius", 0)),
+            }
+    return definitions
+
+
+def hurtbox_defaults():
+    """Starting {name: {"state", "active", "temporary"}} for every hurtbox."""
+    defaults = {}
+    for bone, _ in load_physics_bodies(str(PHYSICS)) if PHYSICS else ():
+        defaults[bone] = {"state": "Default", "active": True, "temporary": False}
+    for name, definition in hurtbox_definitions().items():
+        if definition["type"] == "Existing" and name not in defaults:
+            continue  # override for a body this physics asset does not have
+        defaults[name] = {key: definition[key] for key in ("state", "active", "temporary")}
+    return defaults
+
+
+def apply_hurtbox_event(states, defaults, event):
+    """Apply one ATT HurtboxStateChanges entry to the running state table.
+
+    A blank/"None" name targets every hurtbox and only changes state (in the
+    exported data these events never disable anything, and enabling would
+    wrongly switch on other moves' temporary hurtboxes). State "Default"
+    restores each hurtbox's own configured default, e.g. Ungrabbable limbs.
+    """
+    name = event.get("HurtboxName") or "None"
+    new_state = short_enum(event.get("HurtboxState"), "Default")
+    wildcard = name == "None"
+    for target in (list(states) if wildcard else [name]):
+        if target not in states:
+            continue
+        entry = states[target]
+        entry["state"] = defaults[target]["state"] if new_state == "Default" else new_state
+        if not wildcard:
+            entry["active"] = bool(event.get("HurtboxActive", True))
+
+
+def hurt_shapes(bones, indices, states=None):
+    states = states if states is not None else hurtbox_defaults()
+    shapes = []
+
+    def tagged(shape, name):
+        status = states.get(name, {"state": "Default", "active": True})
+        return {**shape, "kind": "hurt", "hurtbox": name,
+                "state": status["state"], "active": status["active"]}
+
+    for name, definition in hurtbox_definitions().items():
+        if definition["type"] == "NewSphere":
+            shapes.append(tagged({"shape": "circle", "name": name, "bone": "Root",
+                                  "c": bone_point(bones, indices, "Root", definition["a"]),
+                                  "r": definition["r"]}, name))
+        elif definition["type"] == "NewCapsule":
+            shapes.append(tagged({"shape": "capsule", "name": name, "bone": "Root",
+                                  "a": bone_point(bones, indices, "Root", definition["a"]),
+                                  "b": bone_point(bones, indices, "Root", definition["b"]),
+                                  "r": definition["r"]}, name))
+    for bone, agg_geom in load_physics_bodies(str(PHYSICS)) if PHYSICS else ():
         body = bones[indices[bone]] if bone in indices else None
         if body is None:
             continue
         body_t, body_q, body_scale = body
-        for shape_type, elems in props.get("AggGeom", {}).items():
+        for shape_type, elems in agg_geom.items():
             for elem in elems:
                 center = vec(elem.get("Center", {}))
                 local_center = tuple(center[k] * body_scale[k] for k in range(3))
@@ -554,15 +761,17 @@ def hurt_shapes(bones, indices):
                     half = float(elem.get("Length", 0)) * .5
                     a = tuple(c[k] - axis[k]*half for k in range(3))
                     b = tuple(c[k] + axis[k]*half for k in range(3))
-                    shapes.append({"shape": "capsule", "name": elem.get("Name", bone),
-                                   "bone": bone, "a": a, "b": b,
-                                   "r": float(elem.get("Radius", 0)),
-                                   "collision": elem.get("CollisionEnabled", "unknown")})
+                    # "collision" is Unreal's physics flag, kept for reference
+                    # only; it is not the gameplay hurtbox state.
+                    shapes.append(tagged({"shape": "capsule", "name": elem.get("Name", bone),
+                                          "bone": bone, "a": a, "b": b,
+                                          "r": float(elem.get("Radius", 0)),
+                                          "collision": elem.get("CollisionEnabled", "unknown")}, bone))
                 elif shape_type == "SphereElems":
-                    shapes.append({"shape": "circle", "name": elem.get("Name", bone),
-                                   "bone": bone, "c": c,
-                                   "r": float(elem.get("Radius", 0)),
-                                   "collision": elem.get("CollisionEnabled", "unknown")})
+                    shapes.append(tagged({"shape": "circle", "name": elem.get("Name", bone),
+                                          "bone": bone, "c": c,
+                                          "r": float(elem.get("Radius", 0)),
+                                          "collision": elem.get("CollisionEnabled", "unknown")}, bone))
     return shapes
 
 
@@ -688,6 +897,41 @@ def move_info(attack, name, variant, animation):
     }
 
 
+def hurtbox_state_summary(frames):
+    """Frame ranges where hurtboxes differ from the character's defaults.
+
+    Character-wide defaults (e.g. Loxodont's always-ungrabbable limbs) are
+    left out so each move lists only what the move itself changes. Frame
+    numbers match the PNG numbering.
+    """
+    defaults = hurtbox_defaults()
+    permanent = {name for name, status in defaults.items() if not status["temporary"]}
+    groups = {}
+    for frame in frames:
+        for box in frame["boxes"]:
+            if box.get("kind") != "hurt":
+                continue
+            name = box["hurtbox"]
+            default = defaults.get(name, {"state": "Default", "active": True})
+            if box["active"] != default["active"]:
+                label = "Enabled" if box["active"] else "Disabled"
+            elif box["active"] and box["state"] != default["state"]:
+                label = box["state"]
+            else:
+                continue
+            group = groups.setdefault(label, {"frames": set(), "hurtboxes": set()})
+            group["frames"].add(frame["index"])
+            group["hurtboxes"].add(name)
+    summary = []
+    for label, group in sorted(groups.items(), key=lambda item: min(item[1]["frames"])):
+        names = group["hurtboxes"]
+        # Hurtboxes already in this state by default also count toward "all".
+        covered = names | {name for name in permanent if defaults[name]["state"] == label}
+        summary.append({"state": label, "frames": format_frame_ranges(group["frames"]),
+                        "hurtboxes": "all" if permanent and permanent <= covered else sorted(names)})
+    return summary
+
+
 def write_move_info(move_dir, info):
     json_path = move_dir / "info.json"
     json_path.write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
@@ -701,6 +945,12 @@ def write_move_info(move_dir, info):
                          f" (active {group['active_frames']}; {', '.join(group['hitboxes'])})")
     else:
         lines.append("No hitbox windows are defined in this attack asset.")
+    if info.get("hurtbox_states"):
+        lines.extend(["", "## Hurtbox states", ""])
+        for group in info["hurtbox_states"]:
+            who = ("all hurtboxes" if group["hurtboxes"] == "all"
+                   else ", ".join(group["hurtboxes"]))
+            lines.append(f"- **{group['state']}:** frames {group['frames']} ({who})")
     lines.append("")
     (move_dir / "info.md").write_text("\n".join(lines), encoding="utf-8")
 
@@ -725,6 +975,7 @@ def move_frames(attack, animation_path, ref_local, parents, indices, character_m
     attrs = hitbox_attributes(props)
     active_hitboxes = [[] for _ in range(frame_count)]
     events = [[] for _ in range(frame_count)]
+    hurtbox_changes = []  # (frame, order, raw HurtboxStateChanges entry)
     window_names = [None] * frame_count
     for window in windows:
         start = int(window.get("AnimationStartFrame", 0))
@@ -748,11 +999,16 @@ def move_frames(attack, animation_path, ref_local, parents, indices, character_m
         for event in window.get("HurtboxStateChanges", []) or []:
             frame = start + int(event.get("WindowFrame", 0))
             frame = min(frame_count - 1, max(0, frame))
+            hurtbox_changes.append((frame, len(hurtbox_changes), event))
             events[frame].append({"shape": "event", "kind": "hurtbox_state",
                                   "name": event.get("HurtboxName", "None"),
                                   "state": event.get("HurtboxState", "unknown"),
                                   "active": event.get("HurtboxActive", True)})
 
+    defaults = hurtbox_defaults()
+    hurtbox_states = {name: dict(status) for name, status in defaults.items()}
+    hurtbox_changes.sort(key=lambda item: item[:2])
+    next_change = 0
     frames = []
     animation_fps = float(animation["fps"]) if animation else FPS
     for i in range(frame_count):
@@ -771,9 +1027,10 @@ def move_frames(attack, animation_path, ref_local, parents, indices, character_m
             previous_world = compose_world(previous_local, parents)
         else:
             previous_world = world_pose
-        hurt = hurt_shapes(world_pose, indices)
-        for box in hurt:
-            box["kind"] = "hurt"
+        while next_change < len(hurtbox_changes) and hurtbox_changes[next_change][0] <= i:
+            apply_hurtbox_event(hurtbox_states, defaults, hurtbox_changes[next_change][2])
+            next_change += 1
+        hurt = hurt_shapes(world_pose, indices, hurtbox_states)
         hits = []
         for attr in active_hitboxes[i]:
             attach = attr.get("OffsetBoneName")
@@ -829,15 +1086,16 @@ def camera_for_frames(frames, rotation_clockwise=90):
     for frame in frames:
         for vertices, _, _, _, _, _, _ in frame.get("character_mesh", []):
             if len(vertices):
-                # Convert GLB (X=UE Y, Y=UE Z, Z=UE X) meters back to UE cm,
-                # then fit the rotated camera's horizontal axis.
-                h = vertices[:, 2] * (100 * right[0]) + vertices[:, 0] * (100 * right[1])
+                # Convert GLB meters back to UE cm, then fit the rotated
+                # camera's horizontal axis.
+                ue_x, ue_y, ue_z = gltf_to_ue_cm(vertices)
+                h = ue_x * right[0] + ue_y * right[1]
                 min_h = min(min_h, float(h.min()) - 5)
                 max_h = max(max_h, float(h.max()) + 5)
-                min_z = min(min_z, float(vertices[:, 1].min()) * 100 - 5)
-                max_z = max(max_z, float(vertices[:, 1].max()) * 100 + 5)
+                min_z = min(min_z, float(ue_z.min()) - 5)
+                max_z = max(max_z, float(ue_z.max()) + 5)
         for box in frame["boxes"]:
-            if box.get("kind") not in ("hit", "hurt"):
+            if box.get("kind") not in ("hit", "hurt") or not box_drawn(box):
                 continue
             radius = float(box.get("r", 0))
             points = [box["a"], box["b"]] if box["shape"] == "capsule" else [box["c"]]
@@ -863,6 +1121,43 @@ def project(point, camera):
             round(HEIGHT / 2 - (point[2]-camera["center_z"]) * camera["scale"]))
 
 
+def box_drawn(box):
+    """Hurtboxes switched off by HurtboxActive=false are hidden by default."""
+    return box.get("kind") != "hurt" or box.get("active", True) or HURTBOX_SHOW_DISABLED
+
+
+def composite_box(image, box, camera, fill_rgb, fill_alpha, outline_rgb, outline_alpha,
+                  outline_width):
+    """Alpha-composite one circle/capsule with a separate fill and outline.
+
+    The whole silhouette (capsule body plus end caps) goes into one mask and
+    the outline comes from eroding it, so a capsule gets one outer outline
+    instead of each end circle's ring showing through a translucent fill.
+    """
+    r = box["r"] * camera["scale"]
+    size = image.size
+    shape = Image.new("L", size, 0)
+    draw = ImageDraw.Draw(shape)
+    if box["shape"] == "capsule":
+        a, b = project(box["a"], camera), project(box["b"], camera)
+        draw.line((a, b), fill=255, width=max(1, round(2*r)))
+        ends = (a, b)
+    else:
+        ends = (project(box["c"], camera),)
+    for cx, cy in ends:
+        draw.ellipse((cx-r, cy-r, cx+r, cy+r), fill=255)
+    interior = shape.filter(ImageFilter.MinFilter(2*outline_width + 1))
+    outline = ImageChops.subtract(shape, interior)
+    fill_layer = Image.new("RGBA", size, (*fill_rgb, 0))
+    fill_layer.putalpha(interior.point(lambda v: v * fill_alpha // 255))
+    outline_layer = Image.new("RGBA", size, (*outline_rgb, 0))
+    outline_layer.putalpha(outline.point(lambda v: v * outline_alpha // 255))
+    image = Image.alpha_composite(Image.alpha_composite(image, fill_layer), outline_layer)
+    for temporary in (shape, interior, outline, fill_layer, outline_layer):
+        temporary.close()
+    return image
+
+
 def draw_textured_mesh(layer, primitives, camera):
     """Rasterize palette and normal mapped skinned triangles with a z-buffer."""
     color_buffer = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
@@ -881,9 +1176,10 @@ def draw_textured_mesh(layer, primitives, camera):
             v = vertices[tri]
             n = normals[tri]
             uv = uvs[tri]
-            horizontal = v[:, 2] * (100 * camera["right"][0]) + v[:, 0] * (100 * camera["right"][1])
+            ue_x, ue_y, ue_z = gltf_to_ue_cm(v)
+            horizontal = ue_x * camera["right"][0] + ue_y * camera["right"][1]
             screen_x = WIDTH / 2 + (horizontal-camera["center_horizontal"]) * camera["scale"]
-            screen_y = HEIGHT / 2 - (v[:, 1]*100-camera["center_z"]) * camera["scale"]
+            screen_y = HEIGHT / 2 - (ue_z-camera["center_z"]) * camera["scale"]
             x0 = max(0, int(math.floor(float(screen_x.min()))))
             x1 = min(WIDTH, int(math.ceil(float(screen_x.max()))) + 1)
             y0 = max(0, int(math.floor(float(screen_y.min()))))
@@ -904,9 +1200,11 @@ def draw_textured_mesh(layer, primitives, camera):
             inside = (wa >= -1e-5) & (wb >= -1e-5) & (wc >= -1e-5)
             if not inside.any():
                 continue
-            depth = wa*(v[0, 2]*view_x+v[0, 0]*view_y) + \
-                    wb*(v[1, 2]*view_x+v[1, 0]*view_y) + \
-                    wc*(v[2, 2]*view_x+v[2, 0]*view_y)
+            # (view_x, view_y) is the camera's forward axis (Unreal
+            # Right x Up), pointing away from the viewer. Negate the distance
+            # along it so the max-depth test keeps the nearest surface.
+            vertex_depth = -(ue_x*view_x + ue_y*view_y)
+            depth = wa*vertex_depth[0] + wb*vertex_depth[1] + wc*vertex_depth[2]
             region = depth_buffer[y0:y1, x0:x1]
             visible = inside & (depth >= region)
             if not visible.any():
@@ -970,10 +1268,12 @@ def render_frame(image_path, move_name, frame, camera, show_skeleton=True, show_
                 for tri in indices.reshape(-1, 3):
                     points = vertices[tri]
                     # Painter's order: draw the far side before the near side.
-                    depth = float((points[:, 2]*math.cos(theta) +
-                                   points[:, 0]*math.sin(theta)).mean())
-                    screen = [project((float(v[2])*100, float(v[0])*100, float(v[1])*100), camera)
-                              for v in points]
+                    ue_x, ue_y, ue_z = gltf_to_ue_cm(points)
+                    # Negated distance along the camera's forward axis:
+                    # ascending order draws farthest first, nearest last.
+                    depth = -float((ue_x*math.cos(theta) + ue_y*math.sin(theta)).mean())
+                    screen = [project((float(x), float(y), float(z)), camera)
+                              for x, y, z in zip(ue_x, ue_y, ue_z)]
                     triangles.append((depth, screen, color))
             triangles.sort(key=lambda item: item[0])
             for _, points, color in triangles:
@@ -988,59 +1288,23 @@ def render_frame(image_path, move_name, frame, camera, show_skeleton=True, show_
         draw = ImageDraw.Draw(skeleton_layer, "RGBA")
         for link in frame.get("skeleton", []):
             a, b = project(link["a"], camera), project(link["b"], camera)
-            draw.line((a, b), fill=(235, 240, 245, 128), width=2)
+            draw.line((a, b), fill=(*SKELETON_COLOR, SKELETON_ALPHA), width=2)
         image = Image.alpha_composite(image, skeleton_layer)
         skeleton_layer.close()
 
-    for box in (b for b in frame["boxes"] if b.get("kind") == "hurt"):
-        # Keep hurtboxes visible while making the underlying transparent
-        # background and overlapping shapes easy to see through.
-        edge, fill = (0, 220, 255, 128), (0, 150, 255, 128)
-        if "NoCollision" in box.get("collision", ""):
-            edge, fill = (45, 105, 180, 128), (15, 55, 115, 128)
-        hurt_layer = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(hurt_layer, "RGBA")
-        if box["shape"] == "capsule":
-            a, b, r = project(box["a"], camera), project(box["b"], camera), box["r"]*camera["scale"]
-            draw.line((a, b), fill=edge, width=max(1, round(2*r)))
-            for cx, cy in (a, b):
-                draw.ellipse((cx-r, cy-r, cx+r, cy+r), fill=fill, outline=edge, width=2)
-        else:
-            c, r = project(box["c"], camera), box["r"]*camera["scale"]
-            draw.ellipse((c[0]-r, c[1]-r, c[0]+r, c[1]+r), fill=fill, outline=edge, width=2)
-        # Composite each hurtbox separately so overlap increases opacity while
-        # the animated skeleton remains visible beneath translucent fills.
-        image = Image.alpha_composite(image, hurt_layer)
-        hurt_layer.close()
-
-    hitboxes = [b for b in frame["boxes"] if b.get("kind") == "hit"]
-    for box in hitboxes:
-        r = box["r"]*camera["scale"]
-        response = box.get("hit_response", "").casefold()
-        if "hitgrab" in response:
-            color = (255, 0, 200, 255)  # hit grab
-        elif "grab" in response:
-            color = (170, 45, 255, 255)  # normal or command grab
-        else:
-            color = {
-                "sweet": (213, 0, 249, 255),
-                "sour": (255, 176, 0, 255),
-            }.get(box.get("spot"), (255, 23, 68, 255))
-        edge, fill = color, color
-        layer = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(layer, "RGBA")
-        if box["shape"] == "capsule":
-            a, b = project(box["a"], camera), project(box["b"], camera)
-            draw.line((a, b), fill=edge, width=max(1, round(2*r)))
-            for cx, cy in (a, b):
-                draw.ellipse((cx-r, cy-r, cx+r, cy+r), fill=fill, outline=edge, width=3)
-            c = b
-        else:
-            c = project(box["c"], camera)
-            draw.ellipse((c[0]-r, c[1]-r, c[0]+r, c[1]+r),
-                         fill=fill, outline=edge, width=3)
-        image = Image.alpha_composite(image, layer)
-        layer.close()
+    # Each box is composited separately so overlaps build opacity and the
+    # skeleton stays visible beneath translucent fills.
+    for box in frame["boxes"]:
+        if box.get("kind") == "hurt" and box_drawn(box):
+            fill = hurtbox_color(box)
+            image = composite_box(image, box, camera, fill, HURTBOX_FILL_ALPHA,
+                                  hurtbox_outline_color(fill), HURTBOX_OUTLINE_ALPHA,
+                                  HURTBOX_OUTLINE_WIDTH)
+    for box in frame["boxes"]:
+        if box.get("kind") == "hit":
+            color = hitbox_color(box)
+            image = composite_box(image, box, camera, color, HITBOX_FILL_ALPHA,
+                                  color, HITBOX_OUTLINE_ALPHA, HITBOX_OUTLINE_WIDTH)
     image.save(image_path)
     image.close()
 
@@ -1059,7 +1323,9 @@ def export_variant(attack, name, variant, animation, ref_local, parents, indices
         filename = f"{frame_stem}{frame['index']:04d}.png"
         render_frame(move_dir / filename, f"{name} ({variant})",
                      frame, camera, show_skeleton, show_character)
-    write_move_info(move_dir, move_info(attack, name, variant, animation))
+    info = move_info(attack, name, variant, animation)
+    info["hurtbox_states"] = hurtbox_state_summary(frames)
+    write_move_info(move_dir, info)
     pose_source = "ueanim" if animation and animation.suffix.lower() == ".ueanim" else "reference_skeleton"
     data = {"move": name, "variant": variant, "animation": animation.stem if animation else None,
             "fps": FPS, "animation_source_fps": read_ueanim(str(animation.resolve()))["fps"]
@@ -1068,6 +1334,7 @@ def export_variant(attack, name, variant, animation, ref_local, parents, indices
             "pose_warning": None if pose_source == "ueanim" else REFERENCE_WARNING,
             "camera": camera,
             "hurtbox_asset": str(PHYSICS.relative_to(ROOT)) if PHYSICS else None,
+            "character_data_asset": str(CHARACTER_DATA.relative_to(ROOT)) if CHARACTER_DATA else None,
             "frames": [{key: value for key, value in frame.items() if key != "character_mesh"}
                        for frame in frames]}
     (move_dir / "boxes.json").write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
@@ -1086,18 +1353,20 @@ def main():
                                 help="draw animated bone connections (default)")
     skeleton_group.add_argument("--hide-skeleton", action="store_false", dest="show_skeleton",
                                 help="omit animated bone connections from PNGs")
-    parser.set_defaults(show_skeleton=True)
+    parser.set_defaults(show_skeleton=False)
     parser.add_argument("--show-character", action="store_true",
                         help="render the character mesh from Skins/Default/*.glb beneath boxes")
     parser.add_argument("--skin-textures", "--skin-texture", action="store_true",
                         help="bake the exported color-region masks and material palette onto the mesh (implies --show-character)")
-    parser.add_argument("--camera-rotation", type=float,
-                        help="rotate view clockwise around the character in degrees (mesh overlay defaults to 90)")
+    parser.add_argument("--camera-rotation", type=float, default=90,
+                        help="rotate view clockwise around the character in degrees (default: 90, the "
+                             "gameplay plane with Unreal X across the screen; 0 is the old view along "
+                             "the depth axis)")
     parser.add_argument("--out", type=Path,
                         help="output folder (default: Rivals2/HitboxFrames/<character>)")
     args = parser.parse_args()
     show_character = args.show_character or args.skin_textures
-    global CHAR, ATTACKS, PHYSICS, SKELETON
+    global CHAR, ATTACKS, PHYSICS, SKELETON, CHARACTER_DATA
 
     def discover(character):
         char_dir = CHARACTERS_ROOT / character
@@ -1107,13 +1376,25 @@ def main():
         skeletons = sorted(animation_dir.glob("*Skeleton.json"))
         if not attack_paths or not skeletons:
             return None
-        # Prefer the body physics asset whose basename best matches the attack
-        # prefix (e.g. ATT_Lox_* -> HB_Lox); accessory physics files are ignored.
-        attack_prefix = attack_paths[0].stem.removeprefix("ATT_").split("_")[0].casefold()
-        physics = list(char_dir.glob("HB_*.json"))
-        physics.sort(key=lambda p: (not p.stem.removeprefix("HB_").casefold().startswith(attack_prefix),
-                                   len(p.stem), p.name))
-        return char_dir, attacks_dir, physics[0] if physics else None, skeletons[0], attack_paths
+        # Prefer CD_<Folder>.json (Gouie also has CD_BigGouie.json).
+        character_data = char_dir / f"CD_{character}.json"
+        if not character_data.is_file():
+            character_data = next(iter(sorted(char_dir.glob("CD_*.json"))), None)
+        # The character data asset names the hurtbox physics asset directly.
+        physics_ref = (load_character_data(str(character_data)) if character_data else {}
+                       ).get("HurtboxesPhysicsAsset", {}) or {}
+        named = physics_ref.get("ObjectPath", "").rsplit(".", 1)[0]
+        physics_path = ROOT / f"{named}.json" if named else None
+        if not physics_path or not physics_path.is_file():
+            # Fallback: the HB_*.json whose name matches the attack prefix
+            # (e.g. ATT_Lox_* -> HB_Lox); accessory physics files are ignored.
+            attack_prefix = attack_paths[0].stem.removeprefix("ATT_").split("_")[0].casefold()
+            physics = list(char_dir.glob("HB_*.json"))
+            physics.sort(key=lambda p: (not p.stem.removeprefix("HB_").casefold().startswith(attack_prefix),
+                                       len(p.stem), p.name))
+            physics_path = physics[0] if physics else None
+        return (char_dir, attacks_dir, physics_path, skeletons[0], attack_paths,
+                character_data)
 
     characters = sorted(p.name for p in CHARACTERS_ROOT.iterdir() if p.is_dir()) if args.all_characters else [args.character]
     overall_moves = overall_frames = 0
@@ -1124,7 +1405,7 @@ def main():
                 print(f"Skipping {character}: no attack JSONs or primary Animation/*Skeleton.json")
                 continue
             raise SystemExit(f"Could not find attack JSONs and a skeleton under {CHARACTERS_ROOT / character}")
-        CHAR, ATTACKS, PHYSICS, SKELETON, paths = found
+        CHAR, ATTACKS, PHYSICS, SKELETON, paths, CHARACTER_DATA = found
         default_out = ROOT / "Rivals2/HitboxFrames"
         out_dir = (args.out / character if args.all_characters else args.out) if args.out else default_out / character
         if args.move:
@@ -1162,9 +1443,7 @@ def main():
                 move_dir, count = export_variant(attack, path.stem, variant, animation,
                                                  ref_local, parents, indices, out_dir,
                                                  args.show_skeleton, show_character,
-                                                 character_mesh,
-                                                 args.camera_rotation if args.camera_rotation is not None
-                                                 else (90 if show_character else 0))
+                                                 character_mesh, args.camera_rotation)
                 total_moves += 1
                 total_frames += count
                 try:
