@@ -229,19 +229,48 @@ python make_attack_gif.py Rivals2/HitboxFrames/Loxodont/ATT_Lox_Bair_Grounded --
 python make_attack_gif.py Rivals2/HitboxFrames/Loxodont/ATT_Lox_Bair_Grounded --format webm
 ```
 
-## Optional: export package JSON from the pak with CUE4Parse. 
+## Optional: batch export from the pak (instead of FModel)
 
-Note:
-> This is not fully tested as getting it configured properly was giving me issues and decided to move on with hitbox extraction.
+> **Not yet tested end to end.** The exporter is written against CUE4Parse's current API, and the `check` command has been run against FModel exports, but the build and a full export have not been run on this project yet. Compare a character's output against FModel before replacing your exports.
 
-`export_characters_from_pak.py` can automate package JSON (or raw archive) extraction if `cue4parse` is installed and available on `PATH`. It uses the project-default pak and `.usmap` filenames, or accepts explicit paths:
+`export_characters_from_pak.py` drives a small exporter (`tools/pak_exporter/`) built on [CUE4Parse](https://github.com/FabianFG/CUE4Parse), the library FModel itself uses. One run exports everything the renderer reads for every character, keeping FModel's `Rivals2/Content/Characters/...` layout. It needs `git` and the [.NET 10 SDK](https://dotnet.microsoft.com/download) (`dotnet`), on Windows and Linux alike.
 
 ```bash
-python export_characters_from_pak.py --format list
-python export_characters_from_pak.py --format json --out Rivals2/Exports/Characters
-python export_characters_from_pak.py --pak /path/to/Rivals2-Windows.pak \
-  --usmap /path/to/Rivals2.usmap --format json --out Rivals2/Exports/Characters
+# One time: fetch CUE4Parse at a pinned commit and build the exporter.
+python export_characters_from_pak.py setup
+
+# Dry run: list what each export step would write.
+python export_characters_from_pak.py export --list
+
+# Export everything (existing files are kept; add --overwrite to replace them).
+python export_characters_from_pak.py export
+
+# Just one character, or just some steps:
+python export_characters_from_pak.py export --character Loxodont
+python export_characters_from_pak.py export --steps json,anims
+
+# Report which renderer inputs each character has or is missing.
+python export_characters_from_pak.py check
 ```
 
-Use `--format raw` to extract raw `.uasset`/`.uexp` archive entries. Raw extraction does not create UEFormat `.ueanim` files and is not, by itself, enough to render animated frames. FModel remains the route used here for exporting UEFormat animations.
+Only the default skin is exported. Packages under any other `Skins/<Name>/` folder (Hockey, Lovers, Holiday, ...) are skipped by every step, because the renderer only uses `Skins/Default`. Pass `--all-skins` to include them.
+
+The export steps (`--steps`, default all four):
+
+| Step | Exports | Used for |
+|---|---|---|
+| `json` | Properties of every package under `Characters/`, the same as FModel's "Save Properties" | Attacks (`ATT_`), hurtboxes (`HB_`, `CD_`), skeletons, materials and palettes |
+| `anims` | `Animation/**/AN_*` as UEFormat `.ueanim` | Animated poses |
+| `meshes` | `Skins/Default/SK_*_Default` as `.glb`, with their materials and textures | `--show-character` / `--skin-textures` |
+| `textures` | Every texture in each character folder (all skins, UI art) plus the shared `Shared/` and `DefaultMasks/` folders, as `.png` (curve atlases as `.hdr`) | `--skin-textures` color masks, normal maps, shared eye/mask textures, portraits |
+
+Flags for `export`: `--pak`/`--usmap` override the default file names in the project root. `--game` sets CUE4Parse's engine version (default `GAME_UE5_8`). `--out DIR` writes somewhere other than the project root, which is useful for comparing against FModel. `--aes HEX` supplies a key if the pak is ever encrypted. `--verbose` logs every file.
+
+For `setup`: `--ref COMMIT` builds against a different CUE4Parse commit. By default `setup` also builds CUE4Parse's C++ helpers, which needs `cmake` and a C++ compiler (gcc/clang on Linux, Visual Studio's C++ tools on Windows). Rivals 2 requires them: most of its animations are compressed with the ACL codec, which only the helpers can decode. Without them, those animations fail with `Unsupported compressed data type` (Absa exported 97 of 185, Gouie none). `setup` warns if the helper library didn't build. `--no-natives` skips them, which is fine only for JSON/texture/mesh exports.
+
+Texture export on Linux needs SkiaSharp's Linux native library. The exporter project references `SkiaSharp.NativeAssets.Linux.NoDependencies` for this. Builds from before it was added fail every texture with `The type initializer for 'SkiaSharp.SKImageInfo' threw an exception`, and their meshes have no textures; re-run `setup` to fix them.
+
+On its first run, the exporter downloads two decompression libraries (Oodle and zlib-ng) into `tools/pak_exporter/bin/natives/`, as FModel does. Build output (`tools/vendor/`, `tools/pak_exporter/bin/`) is git-ignored.
+
+The earlier approach used the `cue4parse` Python package. Its Linux installer copies a file into its library folder before creating that folder, so the install fails and Python reports `FileNotFoundException: CUE4Parse`. Version 0.0.9 also imports `DetexHelper`, which current CUE4Parse no longer has. This project no longer uses that package. `pip uninstall cue4parse pythonnet clr_loader` removes it from the venv.
 
