@@ -4,7 +4,7 @@ This project reads FModel exports for Rivals 2, builds a per-frame representatio
 
 ## **DISCLAIMER**
 
-Yes, I had AI help me work thru a lot of the data aggregation, so I could get this project completed in a week instead of what would likely take me months. If you disagree, you can leave lodge your discontent in issues and I will reply to them.
+Yes, I had AI help me work thru a lot of the data aggregation, so I could get this project completed in a week instead of what would likely take me months. I did most of the initial work figuring out a workflow of pak extraction and going through Loxodont (my main) files so I could understand what was needed. If you disagree, you can leave lodge your discontent in issues and I will reply to them.
 
 ___
 
