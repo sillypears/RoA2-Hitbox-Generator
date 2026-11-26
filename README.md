@@ -1,11 +1,12 @@
 # Rivals 2 hitbox and hurtbox frames
 
-This project reads FModel exports for Rivals 2, builds a per-frame representation of attack and hurt boxes, renders transparent PNGs, and then stitches each move into a GIF (or webm/apng).
+This project reads FModel exports for Rivals 2, builds a per-frame representation of attack and hurt boxes, renders transparent PNGs, and then stitches each move into a GIF (or webm/apng). It can also render a character mesh exported as GLB beneath the boxes.
 
 The expected inputs are:
 
 - FModel property JSON for the attack assets (`ATT_*.json`), the character's body physics asset (`HB_*.json`), and the main skeleton (`Animation/*Skeleton.json`).
 - A matching UEFormat animation file (`.ueanim`) for each move animation. Without it, the renderer uses the skeleton reference pose and marks that output as a fallback.
+- Optional GLB character meshes under `Skins/Default/`, exported from FModel with **Models → Mesh Format → glTF 2.0**. The overlay option requires this per character.
 
 ## 1. Configure FModel and the `.usmap`
 
@@ -87,6 +88,8 @@ Run commands from the repository directory. Pillow is needed for PNG/GIF renderi
 python -m pip install -r requirements.txt
 ```
 
+NumPy is used to skin the GLB mesh vertices against each sampled animation pose.
+
 The renderer can read compressed `.ueanim` files using the `zstandard` Python package or the system `libzstd`. If neither is available, install the Python package:
 
 ```bash
@@ -107,7 +110,11 @@ Render just one character or move:
 python rivals2_move_boxes.py --character Loxodont
 python rivals2_move_boxes.py --character Loxodont --move ATT_Lox_Bair
 python rivals2_move_boxes.py --character Loxodont --move ATT_Lox_Bair --hide-skeleton
+python rivals2_move_boxes.py --character Loxodont --move ATT_Lox_Bair --show-character
+python rivals2_move_boxes.py --character Loxodont --move ATT_Lox_Bair --skin-textures
 ```
+
+`--show-character` looks for `Skins/Default/SK_*_Default.glb`, applies the matching `.ueanim` pose, and draws the mesh behind the skeleton and boxes. `--skin-textures` (also accepted as `--skin-texture`) bakes the exported color-region masks, resolves the skin palette through its `CS_*.json` to the referenced `PS_*.json`, and applies each material's exported normal map with basic banded lighting; it implies `--show-character`. This does not reproduce the game's full custom toon shader or outlines. With the mesh enabled, the camera rotates 90° clockwise around the character; the boxes use the same projection so they remain aligned. Use `--camera-rotation 0` for the original side view, or pass another angle in degrees. Without either mesh flag, the existing side view remains the default. Export the default skeletal mesh to GLB for each character you want to use with these options.
 
 By default, outputs go to `Rivals2/HitboxFrames/<Character>/`. Each attack animation variant gets a folder, such as `ATT_Lox_Bair_Grounded/`. PNGs use a descriptive filename that includes game, character, attack asset, variant, and 1-based frame number:
 

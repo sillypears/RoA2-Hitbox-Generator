@@ -24,6 +24,8 @@ import math
 import struct
 from pathlib import Path
 
+import numpy as np
+
 try:
     from PIL import Image, ImageDraw
 except ImportError as exc:
@@ -219,6 +221,222 @@ def read_skeleton():
         parents.append(parent)
         indices[info["Name"]] = i
     return compose_world(local, parents), indices, local, parents
+
+
+class GLBCharacter:
+    """Small GLB skinning reader for rendering a character behind the boxes."""
+    COMPONENTS = {5121: np.dtype("u1"), 5123: np.dtype("<u2"),
+                  5125: np.dtype("<u4"), 5126: np.dtype("<f4")}
+    WIDTHS = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT4": 16}
+
+    def __init__(self, path, skeleton_indices, skin_textures=False):
+        self.path = Path(path)
+        raw = self.path.read_bytes()
+        if raw[:4] != b"glTF":
+            raise ValueError(f"{path} is not a binary glTF file")
+        offset = 12
+        document, binary = None, b""
+        while offset < len(raw):
+            length, kind = struct.unpack_from("<I4s", raw, offset)
+            offset += 8
+            chunk = raw[offset:offset+length]
+            offset += length
+            if kind == b"JSON":
+                document = json.loads(chunk)
+            elif kind == b"BIN\0":
+                binary = chunk
+        if document is None:
+            raise ValueError(f"{path} has no GLB JSON chunk")
+        self.doc = document
+        self.binary = binary
+        self.skeleton_indices = skeleton_indices
+        skins = document.get("skins", [])
+        if not skins:
+            raise ValueError(f"{path} has no skeletal skin")
+        self.joints = [document["nodes"][i].get("name", "") for i in skins[0]["joints"]]
+        missing = [name for name in self.joints if name not in skeleton_indices]
+        if missing:
+            raise ValueError(f"{path} has joints absent from the reference skeleton: {missing[:5]}")
+        self.inverse_bind = self.accessor(skins[0]["inverseBindMatrices"]).reshape(-1, 4, 4).transpose(0, 2, 1)
+        self.primitives = []
+        self.skin_textures = skin_textures
+        for mesh in document.get("meshes", []):
+            for primitive in mesh.get("primitives", []):
+                attributes = primitive["attributes"]
+                positions = self.accessor(attributes["POSITION"]).astype(np.float32, copy=False)
+                normals = self.accessor(attributes["NORMAL"]).astype(np.float32, copy=False)
+                joints = self.accessor(attributes["JOINTS_0"]).astype(np.int32, copy=False)
+                weights = self.accessor(attributes["WEIGHTS_0"]).astype(np.float32, copy=False)
+                uv = (self.accessor(attributes["TEXCOORD_0"]).astype(np.float32, copy=False)
+                      if skin_textures and "TEXCOORD_0" in attributes else None)
+                indices = (self.accessor(primitive["indices"]).reshape(-1).astype(np.int32)
+                           if "indices" in primitive else np.arange(len(positions), dtype=np.int32))
+                material = int(primitive.get("material", 0))
+                material_name = document.get("materials", [])[material].get("name", "")
+                # Use stable, opaque neutral colors for the first mesh overlay.
+                # FModel's exported CM textures are palette masks, not final
+                # base-color maps, so sampling them would show misleading colors.
+                colors = ((196, 145, 102), (105, 92, 78), (220, 190, 145),
+                          (175, 125, 90), (90, 70, 55), (140, 100, 72), (205, 165, 125))
+                color = colors[material % len(colors)]
+                baked_texture = self.bake_palette_texture(material_name) if skin_textures else None
+                normal_texture = self.load_normal_texture(material_name) if skin_textures else None
+                if skin_textures and uv is None:
+                    raise ValueError(f"{material_name} has no TEXCOORD_0 UV channel")
+                self.primitives.append((positions, normals, joints, weights, indices,
+                                        color, uv, baked_texture, normal_texture))
+        if not self.primitives:
+            raise ValueError(f"{path} has no mesh primitives")
+
+    def accessor(self, index):
+        accessor = self.doc["accessors"][index]
+        if "sparse" in accessor:
+            raise ValueError("Sparse GLB accessors are not supported")
+        view = self.doc["bufferViews"][accessor["bufferView"]]
+        dtype = self.COMPONENTS[accessor["componentType"]]
+        width = self.WIDTHS[accessor["type"]]
+        itemsize = dtype.itemsize
+        stride = view.get("byteStride", width * itemsize)
+        start = view.get("byteOffset", 0) + accessor.get("byteOffset", 0)
+        return np.ndarray((accessor["count"], width), dtype=dtype, buffer=self.binary,
+                          offset=start, strides=(stride, itemsize))
+
+    def bake_palette_texture(self, material_name):
+        """Bake mask slots using the material defaults and skin color-slot palette."""
+        instance_path = self.path.parent / f"{material_name}.json"
+        if not instance_path.is_file():
+            instance_path = next((CHARACTERS_ROOT.rglob(f"{material_name}.json")), None)
+        if instance_path is None or not instance_path.is_file():
+            raise ValueError(f"missing material instance properties {instance_path}")
+        instance = json.loads(instance_path.read_text(encoding="utf-8"))
+        textures = instance.get("Textures", {})
+        params = instance.get("Colors", {})
+        color_mask = textures.get("ColorRegionMask") or textures.get("PM_Diffuse")
+        if not isinstance(color_mask, dict):
+            base = params.get("BaseColorTint", {}).get("Hex", "B0B0B0")
+            rgb = np.array([int(base[i:i+2], 16) for i in (0, 2, 4)], dtype=np.uint8)
+            return rgb.reshape(1, 1, 3)
+        object_path = color_mask.get("ObjectPath", "").rsplit(".", 1)[0]
+        mask_path = ROOT / f"{object_path}.png"
+        if not mask_path.is_file():
+            raise ValueError(f"missing color-region mask PNG {mask_path}")
+
+        mask = np.asarray(Image.open(mask_path).convert("RGB"), dtype=np.uint8)
+        # CM RGB bits encode a one-based material color slot. The material
+        # parameters are zero-based for the first three slots; slot four uses
+        # the special CustomColorX parameter, followed by CustomColor3+.
+        codes = ((mask[:, :, 0] >= 128).astype(np.uint8) |
+                 ((mask[:, :, 1] >= 128).astype(np.uint8) << 1) |
+                 ((mask[:, :, 2] >= 128).astype(np.uint8) << 2))
+        palette = np.zeros((8, 3), dtype=np.uint8)
+        tint = params.get("BaseColorTint", {}).get("Hex", "FFFFFF")
+        tint_rgb = np.array([int(tint[i:i+2], 16) for i in (0, 2, 4)], dtype=np.float32) / 255
+        slot_parameter = {1: "CustomColor0", 2: "CustomColor1", 3: "CustomColor2",
+                          4: "CustomColorX", 5: "CustomColor3", 6: "CustomColor4",
+                          7: "CustomColor5"}
+        palette_colors, names_by_default_color = self.read_skin_palette()
+        palette[0] = (128, 128, 128)  # unassigned/black CM regions
+        for slot, parameter in slot_parameter.items():
+            color = params.get(parameter, {})
+            hex_color = color.get("Hex", "808080")
+            # FModel's MI JSON contains the slot's fallback/default color.
+            # The selected CS -> PS palette contains the player-facing color;
+            # find a matching named definition automatically when available.
+            palette_name = names_by_default_color.get(hex_color.upper())
+            hex_color = palette_colors.get(palette_name, hex_color)
+            rgb = np.array([int(hex_color[i:i+2], 16) for i in (0, 2, 4)], dtype=np.float32)
+            palette[slot] = np.clip(np.rint(rgb * tint_rgb), 0, 255).astype(np.uint8)
+        return palette[codes]
+
+    def load_normal_texture(self, material_name):
+        """Load the per-material tangent-space normal map when the export has it."""
+        instance_path = self.path.parent / f"{material_name}.json"
+        if not instance_path.is_file():
+            instance_path = next((CHARACTERS_ROOT.rglob(f"{material_name}.json")), None)
+        if instance_path is None or not instance_path.is_file():
+            return None
+        instance = json.loads(instance_path.read_text(encoding="utf-8"))
+        textures = instance.get("Textures", {})
+        normal = textures.get("Normal") or textures.get("PM_Normals")
+        if not isinstance(normal, dict) or not normal.get("ObjectPath"):
+            return None
+        object_path = normal["ObjectPath"].rsplit(".", 1)[0]
+        normal_path = ROOT / f"{object_path}.png"
+        if not normal_path.is_file():
+            return None
+        return np.asarray(Image.open(normal_path).convert("RGB"), dtype=np.uint8)
+
+    def read_skin_palette(self):
+        """Resolve this skin's default CS asset to its PS named color values."""
+        neutral = self.path.parent / "Data/Palettes/Neutral"
+        slot_assets = sorted(neutral.glob("CS_*.json")) if neutral.is_dir() else []
+        if not slot_assets:
+            palettes = self.path.parent / "Data/Palettes"
+            slot_assets = sorted(palettes.glob("*/CS_*.json")) if palettes.is_dir() else []
+        for slot_path in slot_assets:
+            slot_data = json.loads(slot_path.read_text(encoding="utf-8"))
+            slot_object = next((entry for entry in slot_data
+                                if entry.get("Name", "").startswith("Default__")), None)
+            if not slot_object:
+                continue
+            ref = slot_object.get("Properties", {}).get("BaseColorPalette", {}).get("ObjectPath", "")
+            asset_path = ref.rsplit(".", 1)[0]
+            palette_path = ROOT / f"{asset_path}.json"
+            if not palette_path.is_file():
+                continue
+            palette_data = json.loads(palette_path.read_text(encoding="utf-8"))
+            palette_object = next((entry for entry in palette_data
+                                   if entry.get("Name", "").startswith("Default__")), None)
+            definitions = (palette_object or {}).get("Properties", {}).get("CustomColorSlotDefinitions", [])
+            palette_colors = {}
+            names_by_default_color = {}
+            for entry in definitions:
+                name = entry.get("Key", "")
+                value = entry.get("Value", {}).get("Hex", "")
+                if name and value:
+                    palette_colors[name] = value
+                    names_by_default_color.setdefault(value.upper(), name)
+            return palette_colors, names_by_default_color
+        return {}, {}
+
+    @staticmethod
+    def ue_world_to_gltf(position, rotation):
+        """Convert Unreal cm coordinates (X forward, Z up) to GLB meters."""
+        x, y, z, w = rotation
+        ue_rotation = np.array([
+            [1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)],
+            [2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)],
+            [2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)],
+        ], dtype=np.float32)
+        # GLB basis = (Unreal Y, Unreal Z, Unreal X), a cyclic permutation.
+        basis = np.array([[0, 1, 0], [0, 0, 1], [1, 0, 0]], dtype=np.float32)
+        result = np.eye(4, dtype=np.float32)
+        result[:3, :3] = basis @ ue_rotation @ basis.T
+        result[:3, 3] = (position[1] * .01, position[2] * .01, position[0] * .01)
+        return result
+
+    def posed_primitives(self, world_pose):
+        joint_matrices = np.stack([
+            self.ue_world_to_gltf(*world_pose[self.skeleton_indices[name]][:2])
+            for name in self.joints
+        ]) @ self.inverse_bind
+        result = []
+        for positions, normals, joints, weights, indices, color, uv, texture, normal_texture in self.primitives:
+            skinned = np.zeros((len(positions), 3), dtype=np.float32)
+            skinned_normals = np.zeros((len(normals), 3), dtype=np.float32)
+            homogeneous = np.concatenate((positions, np.ones((len(positions), 1), dtype=np.float32)), axis=1)
+            for influence in range(joints.shape[1]):
+                joint_ids = joints[:, influence]
+                influence_weights = weights[:, influence:influence+1]
+                matrices = joint_matrices[joint_ids]
+                transformed = np.einsum("nij,nj->ni", matrices, homogeneous)[:, :3]
+                skinned += transformed * influence_weights
+                transformed_normals = np.einsum("nij,nj->ni", matrices[:, :3, :3], normals)
+                skinned_normals += transformed_normals * influence_weights
+            lengths = np.linalg.norm(skinned_normals, axis=1, keepdims=True)
+            skinned_normals /= np.maximum(lengths, 1e-8)
+            result.append((skinned, skinned_normals, indices, color, uv, texture, normal_texture))
+        return result
 
 
 def compose_world(local_pose, parents):
@@ -487,7 +705,7 @@ def write_move_info(move_dir, info):
     (move_dir / "info.md").write_text("\n".join(lines), encoding="utf-8")
 
 
-def move_frames(attack, animation_path, ref_local, parents, indices):
+def move_frames(attack, animation_path, ref_local, parents, indices, character_mesh=None):
     props = attack.get("Properties", {})
     windows = props.get("Windows", []) or []
     frame_count = max((int(w.get("AnimationStartFrame", 0)) +
@@ -584,51 +802,184 @@ def move_frames(attack, animation_path, ref_local, parents, indices):
                 hits.append({**shape, "name": attr.get("Name", "Hitbox"), "bone": attach,
                              "r": float(attr.get("Radius", 0)),
                              "interpolation": interpolation,
+                             "hit_response": str(attr.get("HitResponse", "")),
                              "damage_property": attr.get("OnHitPropertiesName", ""),
                              "spot": hitbox_spot(attr.get("Name", ""),
                                                  attr.get("OnHitPropertiesName", ""))})
         skeleton_lines = [{"a": world_pose[parent][0], "b": world_pose[index][0]}
                           for index, parent in enumerate(parents) if parent >= 0]
-        frames.append({"index": i + 1, "game_frame_zero_based": i,
+        frame_data = {"index": i + 1, "game_frame_zero_based": i,
                        "animation_frame": animation_frame,
                        "pose_source": pose_source, "window": window_names[i],
                        "skeleton": skeleton_lines,
-                       "boxes": hurt + hits + events[i]})
+                       "boxes": hurt + hits + events[i]}
+        if character_mesh:
+            frame_data["character_mesh"] = character_mesh.posed_primitives(world_pose)
+        frames.append(frame_data)
     return frames
 
 
-def camera_for_frames(frames):
+def camera_for_frames(frames, rotation_clockwise=90):
     # Fit the union of every sampled hurtbox and hitbox so later active frames
     # cannot be clipped as the weapon moves away from the character.
-    min_y = min_z = float("inf")
-    max_y = max_z = float("-inf")
+    theta = math.radians(-rotation_clockwise)
+    right = (-math.sin(theta), math.cos(theta))
+    min_h = min_z = float("inf")
+    max_h = max_z = float("-inf")
     for frame in frames:
+        for vertices, _, _, _, _, _, _ in frame.get("character_mesh", []):
+            if len(vertices):
+                # Convert GLB (X=UE Y, Y=UE Z, Z=UE X) meters back to UE cm,
+                # then fit the rotated camera's horizontal axis.
+                h = vertices[:, 2] * (100 * right[0]) + vertices[:, 0] * (100 * right[1])
+                min_h = min(min_h, float(h.min()) - 5)
+                max_h = max(max_h, float(h.max()) + 5)
+                min_z = min(min_z, float(vertices[:, 1].min()) * 100 - 5)
+                max_z = max(max_z, float(vertices[:, 1].max()) * 100 + 5)
         for box in frame["boxes"]:
             if box.get("kind") not in ("hit", "hurt"):
                 continue
             radius = float(box.get("r", 0))
             points = [box["a"], box["b"]] if box["shape"] == "capsule" else [box["c"]]
             for point in points:
-                min_y = min(min_y, point[1] - radius)
-                max_y = max(max_y, point[1] + radius)
+                horizontal = point[0] * right[0] + point[1] * right[1]
+                min_h = min(min_h, horizontal - radius)
+                max_h = max(max_h, horizontal + radius)
                 min_z = min(min_z, point[2] - radius)
                 max_z = max(max_z, point[2] + radius)
-    if not math.isfinite(min_y):
-        return {"scale": SCALE, "center_y": 0.0, "center_z": VIEW_CENTER_Z}
-    span_y, span_z = max(1.0, max_y-min_y), max(1.0, max_z-min_z)
-    scale = min((WIDTH-110)/span_y, (HEIGHT-150)/span_z)
-    return {"scale": scale, "center_y": (min_y+max_y)*.5,
-            "center_z": (min_z+max_z)*.5}
+    if not math.isfinite(min_h):
+        return {"scale": SCALE, "center_horizontal": 0.0, "center_z": VIEW_CENTER_Z,
+                "right": right, "rotation_clockwise": rotation_clockwise}
+    span_h, span_z = max(1.0, max_h-min_h), max(1.0, max_z-min_z)
+    scale = min((WIDTH-110)/span_h, (HEIGHT-150)/span_z)
+    return {"scale": scale, "center_horizontal": (min_h+max_h)*.5,
+            "center_z": (min_z+max_z)*.5, "right": right,
+            "rotation_clockwise": rotation_clockwise}
 
 
 def project(point, camera):
-    # Rivals uses UE's Y/Z gameplay plane; X is depth.
-    return (round(WIDTH / 2 + (point[1]-camera["center_y"]) * camera["scale"]),
+    horizontal = point[0]*camera["right"][0] + point[1]*camera["right"][1]
+    return (round(WIDTH / 2 + (horizontal-camera["center_horizontal"]) * camera["scale"]),
             round(HEIGHT / 2 - (point[2]-camera["center_z"]) * camera["scale"]))
 
 
-def render_frame(image_path, move_name, frame, camera, show_skeleton=True):
+def draw_textured_mesh(layer, primitives, camera):
+    """Rasterize palette and normal mapped skinned triangles with a z-buffer."""
+    color_buffer = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+    depth_buffer = np.full((HEIGHT, WIDTH), -np.inf, dtype=np.float32)
+    theta = math.radians(-camera["rotation_clockwise"])
+    view_x, view_y = math.cos(theta), math.sin(theta)
+    light = np.array((-0.35, 0.65, 0.68), dtype=np.float32)
+    light /= np.linalg.norm(light)
+    for vertices, normals, indices, _, uvs, texture, normal_texture in primitives:
+        if texture is None or uvs is None:
+            continue
+        tex_h, tex_w = texture.shape[:2]
+        if normal_texture is not None:
+            norm_h, norm_w = normal_texture.shape[:2]
+        for tri in indices.reshape(-1, 3):
+            v = vertices[tri]
+            n = normals[tri]
+            uv = uvs[tri]
+            horizontal = v[:, 2] * (100 * camera["right"][0]) + v[:, 0] * (100 * camera["right"][1])
+            screen_x = WIDTH / 2 + (horizontal-camera["center_horizontal"]) * camera["scale"]
+            screen_y = HEIGHT / 2 - (v[:, 1]*100-camera["center_z"]) * camera["scale"]
+            x0 = max(0, int(math.floor(float(screen_x.min()))))
+            x1 = min(WIDTH, int(math.ceil(float(screen_x.max()))) + 1)
+            y0 = max(0, int(math.floor(float(screen_y.min()))))
+            y1 = min(HEIGHT, int(math.ceil(float(screen_y.max()))) + 1)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            x_a, y_a = float(screen_x[0]), float(screen_y[0])
+            x_b, y_b = float(screen_x[1]), float(screen_y[1])
+            x_c, y_c = float(screen_x[2]), float(screen_y[2])
+            denom = (y_b-y_c)*(x_a-x_c) + (x_c-x_b)*(y_a-y_c)
+            if abs(denom) < 1e-8:
+                continue
+            gx, gy = np.meshgrid(np.arange(x0, x1, dtype=np.float32) + .5,
+                                 np.arange(y0, y1, dtype=np.float32) + .5)
+            wa = ((y_b-y_c)*(gx-x_c) + (x_c-x_b)*(gy-y_c)) / denom
+            wb = ((y_c-y_a)*(gx-x_c) + (x_a-x_c)*(gy-y_c)) / denom
+            wc = 1.0 - wa - wb
+            inside = (wa >= -1e-5) & (wb >= -1e-5) & (wc >= -1e-5)
+            if not inside.any():
+                continue
+            depth = wa*(v[0, 2]*view_x+v[0, 0]*view_y) + \
+                    wb*(v[1, 2]*view_x+v[1, 0]*view_y) + \
+                    wc*(v[2, 2]*view_x+v[2, 0]*view_y)
+            region = depth_buffer[y0:y1, x0:x1]
+            visible = inside & (depth >= region)
+            if not visible.any():
+                continue
+            u = wa*uv[0, 0] + wb*uv[1, 0] + wc*uv[2, 0]
+            vcoord = wa*uv[0, 1] + wb*uv[1, 1] + wc*uv[2, 1]
+            tx = np.clip((u * tex_w).astype(np.int32), 0, tex_w-1)
+            ty = np.clip((vcoord * tex_h).astype(np.int32), 0, tex_h-1)
+            base_rgb = texture[ty, tx].astype(np.float32)
+            if normal_texture is not None:
+                du1, dv1 = uv[1]-uv[0]
+                du2, dv2 = uv[2]-uv[0]
+                determinant = du1*dv2-dv1*du2
+                if abs(float(determinant)) > 1e-8:
+                    edge1, edge2 = v[1]-v[0], v[2]-v[0]
+                    tangent = (edge1*dv2-edge2*dv1) / determinant
+                    bitangent = (edge2*du1-edge1*du2) / determinant
+                    norm = np.linalg.norm(tangent)
+                    if norm > 1e-8:
+                        tangent /= norm
+                    norm = np.linalg.norm(bitangent)
+                    if norm > 1e-8:
+                        bitangent /= norm
+                    geom_n = wa[..., None]*n[0] + wb[..., None]*n[1] + wc[..., None]*n[2]
+                    geom_n /= np.maximum(np.linalg.norm(geom_n, axis=2, keepdims=True), 1e-8)
+                    tangent_grid = tangent - geom_n*np.sum(geom_n*tangent, axis=2, keepdims=True)
+                    tangent_grid /= np.maximum(np.linalg.norm(tangent_grid, axis=2, keepdims=True), 1e-8)
+                    handedness = 1.0 if np.dot(np.cross(edge1, edge2), np.cross(tangent, bitangent)) >= 0 else -1.0
+                    bitangent_grid = np.cross(geom_n, tangent_grid) * handedness
+                    ntex = normal_texture[np.clip((vcoord*norm_h).astype(np.int32), 0, norm_h-1),
+                                          np.clip((u*norm_w).astype(np.int32), 0, norm_w-1)].astype(np.float32) / 127.5 - 1
+                    # Rivals normal maps are Unreal/DirectX convention: invert green for this renderer.
+                    ntex[:, :, 1] *= -1
+                    mapped_n = (tangent_grid*ntex[:, :, 0:1] +
+                                bitangent_grid*ntex[:, :, 1:2] + geom_n*ntex[:, :, 2:3])
+                    mapped_n /= np.maximum(np.linalg.norm(mapped_n, axis=2, keepdims=True), 1e-8)
+                    diffuse = np.maximum(0, np.sum(mapped_n*light, axis=2))
+                    shade = np.where(diffuse < .30, .42,
+                                     np.where(diffuse < .62, .70, 1.0)).astype(np.float32)
+                    base_rgb *= shade[..., None]
+            pixels = color_buffer[y0:y1, x0:x1]
+            pixels[visible] = np.clip(base_rgb[visible], 0, 255).astype(np.uint8)
+            region[visible] = depth[visible]
+    rgba = np.zeros((HEIGHT, WIDTH, 4), dtype=np.uint8)
+    rgba[:, :, :3] = color_buffer
+    rgba[:, :, 3] = (depth_buffer > -np.inf).astype(np.uint8) * 255
+    layer.alpha_composite(Image.fromarray(rgba, "RGBA"))
+
+
+def render_frame(image_path, move_name, frame, camera, show_skeleton=True, show_character=False):
     image = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+    if show_character and frame.get("character_mesh"):
+        theta = math.radians(-camera["rotation_clockwise"])
+        mesh_layer = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+        if any(texture is not None for _, _, _, _, _, texture, _ in frame["character_mesh"]):
+            draw_textured_mesh(mesh_layer, frame["character_mesh"], camera)
+        else:
+            draw = ImageDraw.Draw(mesh_layer, "RGBA")
+            triangles = []
+            for vertices, _, indices, color, _, _, _ in frame["character_mesh"]:
+                for tri in indices.reshape(-1, 3):
+                    points = vertices[tri]
+                    # Painter's order: draw the far side before the near side.
+                    depth = float((points[:, 2]*math.cos(theta) +
+                                   points[:, 0]*math.sin(theta)).mean())
+                    screen = [project((float(v[2])*100, float(v[0])*100, float(v[1])*100), camera)
+                              for v in points]
+                    triangles.append((depth, screen, color))
+            triangles.sort(key=lambda item: item[0])
+            for _, points, color in triangles:
+                draw.polygon(points, fill=(*color, 255))
+        image = Image.alpha_composite(image, mesh_layer)
+        mesh_layer.close()
     # Draw the animated rig first so it remains visible through translucent
     # hit/hurt shapes. ImageDraw writes RGBA pixels directly; alpha_composite
     # is needed for proper source-over transparency between layers.
@@ -637,16 +988,16 @@ def render_frame(image_path, move_name, frame, camera, show_skeleton=True):
         draw = ImageDraw.Draw(skeleton_layer, "RGBA")
         for link in frame.get("skeleton", []):
             a, b = project(link["a"], camera), project(link["b"], camera)
-            draw.line((a, b), fill=(235, 240, 245, 145), width=2)
+            draw.line((a, b), fill=(235, 240, 245, 128), width=2)
         image = Image.alpha_composite(image, skeleton_layer)
         skeleton_layer.close()
 
     for box in (b for b in frame["boxes"] if b.get("kind") == "hurt"):
         # Keep hurtboxes visible while making the underlying transparent
         # background and overlapping shapes easy to see through.
-        edge, fill = (0, 220, 255, 51), (0, 150, 255, 51)
+        edge, fill = (0, 220, 255, 128), (0, 150, 255, 128)
         if "NoCollision" in box.get("collision", ""):
-            edge, fill = (45, 105, 180, 51), (15, 55, 115, 51)
+            edge, fill = (45, 105, 180, 128), (15, 55, 115, 128)
         hurt_layer = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
         draw = ImageDraw.Draw(hurt_layer, "RGBA")
         if box["shape"] == "capsule":
@@ -665,10 +1016,17 @@ def render_frame(image_path, move_name, frame, camera, show_skeleton=True):
     hitboxes = [b for b in frame["boxes"] if b.get("kind") == "hit"]
     for box in hitboxes:
         r = box["r"]*camera["scale"]
-        edge, fill = {
-            "sweet": ((213, 0, 249, 255), (213, 0, 249, 86)),
-            "sour": ((255, 176, 0, 255), (255, 176, 0, 86)),
-        }.get(box.get("spot"), ((255, 23, 68, 255), (255, 23, 68, 86)))
+        response = box.get("hit_response", "").casefold()
+        if "hitgrab" in response:
+            color = (255, 0, 200, 255)  # hit grab
+        elif "grab" in response:
+            color = (170, 45, 255, 255)  # normal or command grab
+        else:
+            color = {
+                "sweet": (213, 0, 249, 255),
+                "sour": (255, 176, 0, 255),
+            }.get(box.get("spot"), (255, 23, 68, 255))
+        edge, fill = color, color
         layer = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
         draw = ImageDraw.Draw(layer, "RGBA")
         if box["shape"] == "capsule":
@@ -688,10 +1046,11 @@ def render_frame(image_path, move_name, frame, camera, show_skeleton=True):
 
 
 def export_variant(attack, name, variant, animation, ref_local, parents, indices, out_dir,
-                   show_skeleton=True):
+                   show_skeleton=True, show_character=False, character_mesh=None,
+                   camera_rotation=90):
     move_dir = out_dir / f"{name}_{variant}"
-    frames = move_frames(attack, animation, ref_local, parents, indices)
-    camera = camera_for_frames(frames)
+    frames = move_frames(attack, animation, ref_local, parents, indices, character_mesh)
+    camera = camera_for_frames(frames, camera_rotation)
     move_dir.mkdir(parents=True, exist_ok=True)
     frame_stem = f"RoA2_{CHAR.name}_{name}_{variant}_HB_"
     for stale in (*move_dir.glob("frame_*.png"), *move_dir.glob(f"{frame_stem}*.png")):
@@ -699,7 +1058,7 @@ def export_variant(attack, name, variant, animation, ref_local, parents, indices
     for frame in frames:
         filename = f"{frame_stem}{frame['index']:04d}.png"
         render_frame(move_dir / filename, f"{name} ({variant})",
-                     frame, camera, show_skeleton)
+                     frame, camera, show_skeleton, show_character)
     write_move_info(move_dir, move_info(attack, name, variant, animation))
     pose_source = "ueanim" if animation and animation.suffix.lower() == ".ueanim" else "reference_skeleton"
     data = {"move": name, "variant": variant, "animation": animation.stem if animation else None,
@@ -709,7 +1068,8 @@ def export_variant(attack, name, variant, animation, ref_local, parents, indices
             "pose_warning": None if pose_source == "ueanim" else REFERENCE_WARNING,
             "camera": camera,
             "hurtbox_asset": str(PHYSICS.relative_to(ROOT)) if PHYSICS else None,
-            "frames": frames}
+            "frames": [{key: value for key, value in frame.items() if key != "character_mesh"}
+                       for frame in frames]}
     (move_dir / "boxes.json").write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     return move_dir, len(frames)
 
@@ -727,9 +1087,16 @@ def main():
     skeleton_group.add_argument("--hide-skeleton", action="store_false", dest="show_skeleton",
                                 help="omit animated bone connections from PNGs")
     parser.set_defaults(show_skeleton=True)
+    parser.add_argument("--show-character", action="store_true",
+                        help="render the character mesh from Skins/Default/*.glb beneath boxes")
+    parser.add_argument("--skin-textures", "--skin-texture", action="store_true",
+                        help="bake the exported color-region masks and material palette onto the mesh (implies --show-character)")
+    parser.add_argument("--camera-rotation", type=float,
+                        help="rotate view clockwise around the character in degrees (mesh overlay defaults to 90)")
     parser.add_argument("--out", type=Path,
                         help="output folder (default: Rivals2/HitboxFrames/<character>)")
     args = parser.parse_args()
+    show_character = args.show_character or args.skin_textures
     global CHAR, ATTACKS, PHYSICS, SKELETON
 
     def discover(character):
@@ -767,6 +1134,18 @@ def main():
                     continue
                 raise SystemExit(f"No attack JSON named {args.move!r} under {ATTACKS}")
         _, indices, ref_local, parents = read_skeleton()
+        character_mesh = None
+        if show_character:
+            glb_candidates = sorted((CHAR / "Skins/Default").glob("SK_*_Default.glb"))
+            if not glb_candidates:
+                print(f"{character}: --show-character requested, but no Skins/Default/SK_*_Default.glb was found")
+            else:
+                try:
+                    character_mesh = GLBCharacter(glb_candidates[0], indices,
+                                                  skin_textures=args.skin_textures)
+                    print(f"{character}: rendering mesh {glb_candidates[0].relative_to(ROOT)}")
+                except (OSError, ValueError, KeyError, IndexError) as exc:
+                    raise SystemExit(f"Could not load character GLB {glb_candidates[0]}: {exc}") from exc
         total_moves = total_frames = 0
         needed_ueanim, missing_ueanim = set(), set()
         for path in paths:
@@ -782,7 +1161,10 @@ def main():
                         missing_ueanim.add(anim_name + ".ueanim")
                 move_dir, count = export_variant(attack, path.stem, variant, animation,
                                                  ref_local, parents, indices, out_dir,
-                                                 args.show_skeleton)
+                                                 args.show_skeleton, show_character,
+                                                 character_mesh,
+                                                 args.camera_rotation if args.camera_rotation is not None
+                                                 else (90 if show_character else 0))
                 total_moves += 1
                 total_frames += count
                 try:
