@@ -229,7 +229,10 @@ Rivals2/*
 Rivals2*.zip
 Rivals2*.pak
 *.json
+
+# Hand-edited config, not exported game data:
+!article_rules.json
+!render_settings.json
+
 # Pak exporter build outputs (python export_characters_from_pak.py setup)
-tools/vendor/
-tools/pak_exporter/bin/
-tools/pak_exporter/obj/
+tools/*

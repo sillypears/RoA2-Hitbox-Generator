@@ -1,0 +1,122 @@
+{
+  "_about": [
+    "Settings for rivals2_move_boxes.py, make_legend.py and run_pipeline.py. Edit freely; no script changes needed.",
+    "Anything missing here falls back to the scripts' built-in values, so you can delete entries you don't care about.",
+    "Colors are [R, G, B] with 0-255 channels, or \"#RRGGBB\". Alpha (opacity) is 0 (invisible) to 255 (solid): 50% = 128, 80% = 204, 90% = 230.",
+    "After changing colors, run: python make_legend.py   (redraws images/box_legend.png)",
+    "Keys starting with _ are notes and are ignored."
+  ],
+
+  "hitbox": {
+    "fill_alpha": 150,
+    "outline_alpha": 255,
+    "outline_width": 3,
+    "colors": {
+      "normal": [237, 56, 92],
+      "sweet": [213, 0, 249],
+      "sour": [255, 176, 0],
+      "tipper": [79, 195, 247],
+      "projectile": [255, 235, 59],
+      "grab": [153, 0, 255],
+      "hitgrab": [255, 0, 200],
+      "detect": [164, 121, 20],
+      "kill_projectiles": [141, 110, 99]
+    },
+    "_colors": {
+      "order": "Picked by HitResponse first (grab, hitgrab, detect, kill_projectiles), then projectile, tipper, then the sweet/sour name label, else normal.",
+      "normal": "Hit with no sweet/sour label",
+      "sweet": "Hit whose hitbox or damage-property name contains \"sweet\"",
+      "sour": "Hit whose name contains \"sour\"",
+      "tipper": "Hit whose damage properties have a tipper effect (see tipper_effects); light blue like training mode",
+      "projectile": "Hit from a projectile article (Zetterburn's fireball, Fleet's arrows...); yellow like training mode",
+      "grab": "HitResponse Grab: standard and command grabs",
+      "hitgrab": "HitResponse HitGrab: grabs on hit",
+      "detect": "HitResponse Detect/DetectAll: triggers or sensors, no damage",
+      "kill_projectiles": "HitResponse KillProjectiles: destroys projectiles only"
+    }
+  },
+
+  "hurtbox": {
+    "fill_alpha": 80,
+    "outline_alpha": 160,
+    "outline_width": 2,
+    "outline_lighten": 0.45,
+    "show_disabled": false,
+    "colors": {
+      "Default": [66, 255, 37],
+      "Vulnerable": [0, 150, 255],
+      "Ungrabbable": [244, 255, 41],
+      "Unhitgrabbable": [0, 255, 242],
+      "Intangible": [190, 190, 205],
+      "ProjectileIntangible": [0, 79, 163],
+      "Invulnerable": [28, 255, 145],
+      "Countering": [255, 120, 40],
+      "Parrying": [115, 255, 0],
+      "Inactive": [70, 70, 80],
+      "Disabled": [40, 40, 40]
+    },
+    "_notes": {
+      "colors": "One per gameplay state (ERivalsHurtboxState). Disabled = HurtboxActive false, drawn only if show_disabled is true.",
+      "outline_lighten": "Outline is the fill tinted toward white: 0 = same as fill, 1 = white."
+    }
+  },
+
+  "skeleton": {
+    "color": [235, 240, 245],
+    "alpha": 128,
+    "_note": "Only drawn with --show-skeleton."
+  },
+
+  "tipper_effects": ["TipperStun", "AutoTipperOnly"],
+  "_tipper_effects": "On-hit SpecialEffect values drawn in the tipper color. Training mode colors only Clairen's tipper; add another effect here if training shows it in its own color.",
+
+  "articles": {
+    "extra_frames": 10,
+    "_extra_frames": "Past a move's end, keep rendering at most this many frames while an article's hitboxes are still appearing or changing (the character holds its last pose). Per-move behavior rules are in article_rules.json."
+  },
+
+  "info_notes_defaults": {
+    "HitstunMultiplier": 1.0,
+    "HitfallHitstunMultiplier": 1.0,
+    "HitpauseMultiplier": 1.0,
+    "ExtraHitpauseForOpponent": 0,
+    "HitpauseMovementType": "None",
+    "SDIMultiplier": 1.0,
+    "ASDIMultiplier": -1.0,
+    "bCanReverse": true,
+    "bReverseBasedOnHorizontalSpeed": false,
+    "bForceFlinch": false,
+    "GroundTechable": true,
+    "bIgnoresWeight": false,
+    "bPreventGroundBounce": false,
+    "bAutoFloorhuggable": false,
+    "ProjectileInteraction": "Default",
+    "bForceKnockbackInKnockdown": false,
+    "bPreserveFacing": false,
+    "KnockbackAngleMode": "SpecifiedAngle",
+    "ParryReaction": "Stun",
+    "GrabPartnerInteraction": "None",
+    "ExtraShieldStun": 0,
+    "ShieldDamageMultiplier": 1.0,
+    "ShieldPushbackMultiplier": 1.0,
+    "ShieldHitpauseMultiplier": 1.0,
+    "FullChargeKnockbackMultiplier": 1.3,
+    "FullChargeDamageMultiplier": 1.6,
+    "DriftDiMultiplier": 1.0,
+    "FinalBaseKnockback": 0.0,
+    "ForceTumble": false,
+    "IgnoreKnockbackArmor": false,
+    "IgnoreSuperArmor": false,
+    "IgnoreInvincibility": false,
+    "PreventChaingrabsOnHit": false,
+    "bIsWindbox": false,
+    "bReflectProjectiles": false,
+    "HitstunAnimationStateOverride": "None"
+  },
+  "_info_notes_defaults": "info.md's Notes column lists a hit's AdvancedOnHitProperties only when they differ from these usual values (the most common value across the game). Change a value to show or hide that setting.",
+
+  "pipeline": {
+    "default_skips": ["Intro", "Taunt", "_OLD$"],
+    "_default_skips": "Moves run_pipeline.py skips unless --no-default-skips: case-insensitive regular expressions matched against the attack asset name (ATT_Lox_Intro). --skip REGEX adds more for one run."
+  }
+}

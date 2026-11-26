@@ -10,8 +10,8 @@ Three commands:
            Rivals2/Content/Characters/... layout:
              json      properties of every package (ATT_, HB_, CD_, skeletons,
                        materials, palettes, ...) like FModel "Save Properties"
-             anims     Animation/**/AN_*            -> .ueanim (UEFormat)
-             meshes    Skins/Default/SK_*_Default   -> .glb (+ materials/textures)
+             anims     every AN_* (character + article) -> .ueanim (UEFormat)
+             meshes    Skins/Default/**/SK_* (character + article meshes) -> .glb (+ materials/textures)
              textures  every texture in the character folders plus
                        Shared/ and DefaultMasks/ -> .png (curve atlases .hdr)
            Only the default skin is exported: packages under any other
@@ -20,10 +20,26 @@ Three commands:
            already on disk are kept.
   check    Report, per character, which renderer inputs are present or
            missing. Works on any export tree (FModel or this tool).
+  find-game
+           Print which game install / pak the export would read.
+
+The pak is read straight from the game install, so after a Steam update you
+just run export again. It is found, in order, from:
+  --pak FILE             one specific .pak (every archive beside it is mounted)
+  --game-dir DIR         the install folder (or its Content/Paks folder);
+                         use this for installs outside Steam's libraries
+  RIVALS2_GAME_DIR       environment variable, same meaning as --game-dir
+  Steam                  Rivals 2 (app 2217000) in any Steam library, found
+                         through libraryfolders.vdf: Windows registry/Program
+                         Files, Linux ~/.local/share/Steam, ~/.steam/steam,
+                         Flatpak and Snap Steam
+  ./Rivals2-Windows.pak  a copy in the project root
 
 Examples:
   python export_characters_from_pak.py setup
+  python export_characters_from_pak.py find-game
   python export_characters_from_pak.py export --list            # dry run
+  python export_characters_from_pak.py export --game-dir "/mnt/games/SteamLibrary/steamapps/common/Rivals 2"
   python export_characters_from_pak.py export
   python export_characters_from_pak.py export --character Loxodont --steps json,anims
   python export_characters_from_pak.py check
@@ -33,13 +49,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_PAK = ROOT / "Rivals2-Windows.pak"
+DEFAULT_PAK = ROOT / "Rivals2-Windows.pak"  # last-resort copy in the project root
+PAK_NAME = "Rivals2-Windows.pak"
+STEAM_APP_ID = "2217000"  # Rivals of Aether II
+STEAM_INSTALL_DIR = "Rivals 2"  # steamapps/common/<this>, if the app manifest is unreadable
+GAME_DIR_ENV = "RIVALS2_GAME_DIR"
 DEFAULT_MAP = ROOT / "Rivals2-5.8.0-0+UE5-5418fa4e.usmap"
 CHARACTERS = ROOT / "Rivals2/Content/Characters"
 TOOL_DIR = ROOT / "tools/pak_exporter"
@@ -62,6 +83,127 @@ def run(command, **kwargs):
 def require(tool, hint):
     if not shutil.which(tool):
         raise SystemExit(f"{tool!r} is not on PATH. {hint}")
+
+
+# ---------------------------------------------------------------- find game
+def steam_roots():
+    """Folders where a Steam client may keep steamapps/libraryfolders.vdf."""
+    roots = []
+    if sys.platform == "win32":
+        try:
+            import winreg
+            for hive, key, value in ((winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", "SteamPath"),
+                                     (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath"),
+                                     (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam", "InstallPath")):
+                try:
+                    with winreg.OpenKey(hive, key) as handle:
+                        roots.append(Path(winreg.QueryValueEx(handle, value)[0]))
+                except OSError:
+                    pass
+        except ImportError:
+            pass
+        for env in ("ProgramFiles(x86)", "ProgramFiles"):
+            if os.environ.get(env):
+                roots.append(Path(os.environ[env]) / "Steam")
+    else:
+        home = Path.home()
+        roots += [home / ".local/share/Steam", home / ".steam/steam", home / ".steam/root",
+                  home / ".var/app/com.valvesoftware.Steam/.local/share/Steam",  # Flatpak
+                  home / "snap/steam/common/.local/share/Steam",                  # Snap
+                  home / "Library/Application Support/Steam"]                      # macOS
+    unique, seen = [], set()
+    for root in roots:
+        try:
+            key = root.resolve()
+        except OSError:
+            continue
+        if key not in seen and (root / "steamapps").is_dir():
+            seen.add(key)
+            unique.append(root)
+    return unique
+
+
+def vdf_values(path, key):
+    """All "key" "value" pairs for one key in a Steam .vdf/.acf text file."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    return [m.group(1).replace("\\\\", "\\") for m in re.finditer(rf'"{key}"\s+"([^"]*)"', text, re.I)]
+
+
+def steam_game_dirs():
+    """(install folder, buildid or None) for Rivals 2 in every Steam library."""
+    found, seen = [], set()
+    for root in steam_roots():
+        libraries = [root] + [Path(p) for p in vdf_values(root / "steamapps/libraryfolders.vdf", "path")]
+        for library in libraries:
+            manifest = library / "steamapps" / f"appmanifest_{STEAM_APP_ID}.acf"
+            names = vdf_values(manifest, "installdir") or [STEAM_INSTALL_DIR]
+            build = (vdf_values(manifest, "buildid") or [None])[0]
+            game = library / "steamapps/common" / names[0]
+            try:
+                key = game.resolve()
+            except OSError:
+                continue
+            if key not in seen and game.is_dir():
+                seen.add(key)
+                found.append((game, build))
+    return found
+
+
+def pak_in(folder):
+    """The game pak inside an install folder, its Paks folder, or None."""
+    folder = Path(folder)
+    for paks in (folder, folder / "Content/Paks", folder / "Rivals2/Content/Paks"):
+        if (paks / PAK_NAME).is_file():
+            return paks / PAK_NAME
+    for paks in (folder, folder / "Content/Paks", folder / "Rivals2/Content/Paks"):
+        candidates = sorted(paks.glob("*.pak")) if paks.is_dir() else []
+        if candidates:
+            return candidates[0]
+    return None
+
+
+def locate_pak(pak=None, game_dir=None):
+    """Find the pak to read. Returns (pak path, source description, Steam buildid or None)."""
+    if pak:
+        pak = Path(pak).expanduser()
+        if not pak.is_file():
+            raise SystemExit(f"--pak file not found: {pak}")
+        return pak, "--pak", None
+    for label, folder in (("--game-dir", game_dir), (GAME_DIR_ENV, os.environ.get(GAME_DIR_ENV))):
+        if folder:
+            folder = Path(folder).expanduser()
+            found = pak_in(folder)
+            if not found:
+                raise SystemExit(f"No {PAK_NAME} under {label} {folder} (looked in it, Content/Paks "
+                                 "and Rivals2/Content/Paks)")
+            return found, label, None
+    for game, build in steam_game_dirs():
+        found = pak_in(game)
+        if found:
+            return found, "Steam", build
+    if DEFAULT_PAK.is_file():
+        return DEFAULT_PAK, "project root", None
+    raise SystemExit(
+        "Could not find Rivals 2. Looked in every Steam library "
+        f"({', '.join(str(r) for r in steam_roots()) or 'no Steam install found'}) and for "
+        f"{DEFAULT_PAK.name} in the project root.\nPoint at the install with --game-dir DIR "
+        f"(or set {GAME_DIR_ENV}), e.g. --game-dir \"/path/to/steamapps/common/Rivals 2\".")
+
+
+def cmd_find_game(args):
+    pak, source, build = locate_pak(args.pak, args.game_dir)
+    size = pak.stat().st_size / 1e9
+    print(f"pak:     {pak}  ({size:.2f} GB)")
+    print(f"found:   {source}")
+    if build:
+        print(f"buildid: {build}  (Steam build; changes with every game update)")
+    others = [p.name for p in sorted(pak.parent.iterdir()) if p.suffix.lower() in (".pak", ".utoc") and p != pak]
+    if others:
+        print(f"also mounted from that folder: {', '.join(others)}")
+    return 0
 
 
 # --------------------------------------------------------------------- setup
@@ -108,10 +250,11 @@ def cmd_export(args):
     require("dotnet", "Install the .NET 10 SDK and run the setup command first.")
     if not TOOL_DLL.is_file():
         raise SystemExit(f"{TOOL_DLL.relative_to(ROOT)} not found; run: python {Path(__file__).name} setup")
-    for label, path in (("pak", args.pak), ("usmap", args.usmap)):
-        if not path.is_file():
-            raise SystemExit(f"{label} file not found: {path}")
-    command = ["dotnet", TOOL_DLL, "--pak", args.pak.resolve(), "--usmap", args.usmap.resolve(),
+    pak, source, build = locate_pak(args.pak, args.game_dir)
+    print(f"Reading {pak} (found via {source}{f', Steam build {build}' if build else ''})", file=sys.stderr)
+    if not args.usmap.is_file():
+        raise SystemExit(f"usmap file not found: {args.usmap}")
+    command = ["dotnet", TOOL_DLL, "--pak", pak.resolve(), "--usmap", args.usmap.resolve(),
                "--game", args.game, "--out", args.out.resolve(), "--steps", ",".join(args.steps)]
     for character in args.character:
         command += ["--character", character]
@@ -125,6 +268,8 @@ def cmd_export(args):
         command.append("--list")
     if args.verbose:
         command.append("--verbose")
+    if args.progress:
+        command.append("--progress")
     result = subprocess.run([str(part) for part in command])
     if args.list:
         return result.returncode
@@ -254,7 +399,14 @@ def main():
                             "animations, most of Rivals 2's, will fail to export)")
 
     export = sub.add_parser("export", help="export character data from the pak")
-    export.add_argument("--pak", type=Path, default=DEFAULT_PAK, help=f"game archive (default: {DEFAULT_PAK.name})")
+    def add_game_args(sub_parser):
+        sub_parser.add_argument("--game-dir", type=Path,
+                                help=f"Rivals 2 install folder, e.g. \".../steamapps/common/Rivals 2\" "
+                                     f"(default: ${GAME_DIR_ENV}, else found through Steam)")
+        sub_parser.add_argument("--pak", type=Path,
+                                help="one specific .pak file instead (overrides --game-dir)")
+
+    add_game_args(export)
     export.add_argument("--usmap", type=Path, default=DEFAULT_MAP, help=f"mappings file (default: {DEFAULT_MAP.name})")
     export.add_argument("--game", default="GAME_UE5_8", help="CUE4Parse game version (default: GAME_UE5_8)")
     export.add_argument("--out", type=Path, default=ROOT,
@@ -269,18 +421,24 @@ def main():
                         help="also export non-default skins (default: only Skins/Default; other skins are skipped)")
     export.add_argument("--list", action="store_true", help="dry run: print what each step would export")
     export.add_argument("--verbose", action="store_true", help="log every exported file")
+    export.add_argument("--progress", action="store_true",
+                        help="print machine-readable PROGRESS lines (used by run_pipeline.py's progress bars)")
     export.add_argument("--no-check", action="store_true",
                         help="don't run the check report after exporting (run_pipeline.py runs it once itself)")
 
     check = sub.add_parser("check", help="report missing renderer inputs per character")
     check.add_argument("--character", action="append", default=[], help="only this character (repeatable)")
 
+    find_game = sub.add_parser("find-game", help="show which game install/pak export would read")
+    add_game_args(find_game)
+
     args = parser.parse_args()
     if args.command == "export":
         bad = [s for s in args.steps if s not in STEPS]
         if bad:
             parser.error(f"unknown --steps value(s): {', '.join(bad)}")
-    handler = {"setup": cmd_setup, "export": cmd_export, "check": cmd_check}[args.command]
+    handler = {"setup": cmd_setup, "export": cmd_export, "check": cmd_check,
+               "find-game": cmd_find_game}[args.command]
     return handler(args) or 0
 
 

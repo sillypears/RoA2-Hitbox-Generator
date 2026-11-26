@@ -1,0 +1,36 @@
+{
+  "_about": [
+    "Rules for article behavior that the game decides in code rather than data.",
+    "rivals2_move_boxes.py follows each article's own windows, velocity and gravity from the exported data;",
+    "add a rule here only when a move's frames are wrong because of game code (button release, an article already on stage, ...).",
+    "Keys are attack asset names (ATT_*). Each rule names the article asset (ART_*) and one of:",
+    "  \"switch\": \"<move window>\"   when the move enters that window, the article jumps to \"article_window\"",
+    "  \"existing\": \"<move window>\" the move drives an article already on stage: it appears when the move enters that",
+    "                                window, at \"offset\" (X ahead, Y up, game units) in \"article_window\"",
+    "Optional: \"frame\" (frames into the move window), \"facing\" (1 or -1), \"note\" (shown in info.md)."
+  ],
+  "ATT_Abs_Fspecial": [
+    {
+      "article": "ART_Abs_Cloud",
+      "switch": "Recovery",
+      "article_window": "Place Startup",
+      "note": "releasing special (Channeling -> Recovery) places the cloud; shown releasing after one Channeling loop"
+    }
+  ],
+  "ATT_Abs_NspecialCloud": [
+    {
+      "article": "ART_Abs_Cloud",
+      "existing": "Charge",
+      "offset": {"X": 300, "Y": 100},
+      "article_window": "Charging",
+      "note": "charging an existing cloud, assumed 300 ahead and 100 up"
+    },
+    {
+      "article": "ART_Abs_Cloud",
+      "existing": "Uncharged Active",
+      "offset": {"X": 300, "Y": 100},
+      "article_window": "Pop Active",
+      "note": "popping an existing cloud uncharged (special released during Charge), assumed 300 ahead and 100 up"
+    }
+  ]
+}
