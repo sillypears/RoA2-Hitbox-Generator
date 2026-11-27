@@ -22,6 +22,10 @@ Three commands:
            missing. Works on any export tree (FModel or this tool).
   find-game
            Print which game install / pak the export would read.
+  usmap    Generate a .usmap mappings file from the installed game's
+           executable with UsmapGen (no game launch, no injection), named
+           Rivals2-build<Steam build>.usmap. export uses the newest .usmap in
+           the project root, so after a game update: usmap, then export.
 
 The pak is read straight from the game install, so after a Steam update you
 just run export again. It is found, in order, from:
@@ -61,13 +65,19 @@ PAK_NAME = "Rivals2-Windows.pak"
 STEAM_APP_ID = "2217000"  # Rivals of Aether II
 STEAM_INSTALL_DIR = "Rivals 2"  # steamapps/common/<this>, if the app manifest is unreadable
 GAME_DIR_ENV = "RIVALS2_GAME_DIR"
-DEFAULT_MAP = ROOT / "Rivals2-5.8.0-0+UE5-5418fa4e.usmap"
+DEFAULT_MAP = ROOT / "Rivals2-5.8.0-0+UE5-5418fa4e.usmap"  # Kertic's mapping, from before generation existed
 CHARACTERS = ROOT / "Rivals2/Content/Characters"
 TOOL_DIR = ROOT / "tools/pak_exporter"
 TOOL_PROJECT = TOOL_DIR / "Rivals2PakExporter.csproj"
 TOOL_BIN = TOOL_DIR / "bin"
 TOOL_DLL = TOOL_BIN / "Rivals2PakExporter.dll"
 VENDOR = ROOT / "tools/vendor/CUE4Parse"
+# UsmapGen (Ka1serM) writes a .usmap from the game's executable without
+# running the game. Its source comes with CUE4Parse-Natives; setup builds it.
+USMAPGEN_SOURCE = VENDOR / "CUE4Parse-Natives/UsmapGen/external/UsmapGen"
+USMAPGEN_DIR = ROOT / "tools/usmapgen"
+USMAPGEN_BIN = USMAPGEN_DIR / ("usmapgen.exe" if os.name == "nt" else "usmapgen")
+USMAPGEN_RELEASES = "https://github.com/Ka1serM/UsmapGen/releases"
 CUE4PARSE_URL = "https://github.com/FabianFG/CUE4Parse.git"
 # Commit the exporter was written against (2026-11-23). Newer commits may
 # change CUE4Parse's API; pass --ref to try one.
@@ -165,8 +175,28 @@ def pak_in(folder):
     return None
 
 
+def steam_build_for(pak):
+    """Steam buildid of the install a pak sits in, however it was found."""
+    try:
+        resolved = Path(pak).resolve()
+    except OSError:
+        return None
+    for game, build in steam_game_dirs():
+        try:
+            if resolved.is_relative_to(game.resolve()):
+                return build
+        except OSError:
+            continue
+    return None
+
+
 def locate_pak(pak=None, game_dir=None):
     """Find the pak to read. Returns (pak path, source description, Steam buildid or None)."""
+    found, source, build = _locate_pak(pak, game_dir)
+    return found, source, build or steam_build_for(found)
+
+
+def _locate_pak(pak=None, game_dir=None):
     if pak:
         pak = Path(pak).expanduser()
         if not pak.is_file():
@@ -203,6 +233,87 @@ def cmd_find_game(args):
     others = [p.name for p in sorted(pak.parent.iterdir()) if p.suffix.lower() in (".pak", ".utoc") and p != pak]
     if others:
         print(f"also mounted from that folder: {', '.join(others)}")
+    return 0
+
+
+# --------------------------------------------------------------------- usmap
+def default_usmap():
+    """The newest .usmap in the project root (a generated one wins once it
+    exists), else Kertic's original file name."""
+    maps = sorted(ROOT.glob("*.usmap"), key=lambda p: p.stat().st_mtime)
+    return maps[-1] if maps else DEFAULT_MAP
+
+
+def usmap_name(build):
+    return f"Rivals2-build{build}.usmap" if build else "Rivals2-generated.usmap"
+
+
+def game_executable(pak):
+    """Rivals2-Win64-Shipping.exe for a pak in <install>/Rivals2/Content/Paks."""
+    for folder in (pak.parent, *pak.parents):
+        candidates = sorted((folder / "Binaries/Win64").glob("*-Shipping.exe")) if folder.is_dir() else []
+        if candidates:
+            return candidates[0]
+    return None
+
+
+def build_usmapgen():
+    """Build the usmapgen command-line tool from the vendored source (not on
+    Windows; see USMAPGEN_RELEASES). Returns True when it's ready."""
+    if os.name == "nt":
+        print(f"\nusmapgen: building it on Windows needs llvm-mingw; download usmapgen.exe from "
+              f"{USMAPGEN_RELEASES} into {USMAPGEN_DIR.relative_to(ROOT)} instead.", file=sys.stderr)
+        return USMAPGEN_BIN.is_file()
+    if not (USMAPGEN_SOURCE / "CMakeLists.txt").is_file():
+        print("\nusmapgen: source not checked out (setup --no-natives skips CUE4Parse's submodules).",
+              file=sys.stderr)
+        return False
+    missing = [tool for tool in ("cmake", "clang", "clang++") if not shutil.which(tool)]
+    if missing:
+        print(f"\nusmapgen: not built, needs {', '.join(missing)} (UsmapGen builds with Clang and libc++).",
+              file=sys.stderr)
+        return False
+    build = USMAPGEN_DIR / "build"
+    generator = ["-G", "Ninja"] if shutil.which("ninja") else []
+    # Tests off: UsmapGen's tests download about 2 GB of dedicated servers.
+    run(["cmake", "-S", USMAPGEN_SOURCE, "-B", build, *generator, "-DCMAKE_BUILD_TYPE=Release",
+         "-DCMAKE_C_COMPILER=clang", "-DCMAKE_CXX_COMPILER=clang++",
+         "-DUSMAPGEN_BUILD_TESTS=OFF", "-DUSMAPGEN_BUILD_TOOLS=ON"])
+    built = build / "tools/usmapgen"
+    if subprocess.run(["cmake", "--build", build, "--target", "usmapgen"]).returncode != 0:
+        # Its Linux build links fully static, which needs LLVM's static
+        # libunwind; many distros don't ship it. Link normally instead.
+        print("usmapgen: static link failed, linking against the system libraries instead", file=sys.stderr)
+        libs = [build / "src/libUsmapGen.a", build / "external/zydis/libZydis.a",
+                build / "external/zydis/zycore/libZycore.a", *sorted((build / "external").glob("libUsmapGen*.a"))]
+        run(["clang++", "-O3", "-flto=thin", "-stdlib=libc++", "-fuse-ld=lld",
+             build / "tools/CMakeFiles/usmapgen.dir/Generate/Main.cpp.o", "-o", built, *libs, "-lm"])
+    shutil.copy2(built, USMAPGEN_BIN)
+    print(f"Built {USMAPGEN_BIN.relative_to(ROOT)}")
+    return True
+
+
+def cmd_usmap(args):
+    pak, source, build = locate_pak(args.pak, args.game_dir)
+    exe = game_executable(pak)
+    if not exe:
+        raise SystemExit(f"No Binaries/Win64/*-Shipping.exe found above {pak.parent}")
+    tool = Path(args.usmapgen) if args.usmapgen else USMAPGEN_BIN
+    if not tool.is_file():
+        raise SystemExit(f"{tool} not found. Run: python {Path(__file__).name} setup"
+                         + (f"  (or download usmapgen.exe from {USMAPGEN_RELEASES})" if os.name == "nt" else ""))
+    out = args.out or ROOT / usmap_name(build)
+    if out.is_file() and not args.overwrite:
+        print(f"{out.name} already exists for this game build (--overwrite to regenerate).")
+        return 0
+    command = [tool, exe, out]
+    if args.compression:
+        command += ["--compression", args.compression]
+    run(command)
+    in_root = out.resolve().parent == ROOT
+    print(f"Wrote {out}" + (f" (Steam build {build})" if build else "")
+          + (f". export now uses it by default (newest .usmap in {ROOT.name}/)." if in_root
+             else f". Use it with: export --usmap {out}"))
     return 0
 
 
@@ -243,6 +354,8 @@ def cmd_setup(args):
     elif natives:
         print(f"\nNative helpers: {', '.join(p.name for p in natives)}")
     print(f"Built {TOOL_DLL.relative_to(ROOT)}. Next: python {Path(__file__).name} export --list")
+    if not args.no_natives:
+        build_usmapgen()
 
 
 # -------------------------------------------------------------------- export
@@ -252,8 +365,10 @@ def cmd_export(args):
         raise SystemExit(f"{TOOL_DLL.relative_to(ROOT)} not found; run: python {Path(__file__).name} setup")
     pak, source, build = locate_pak(args.pak, args.game_dir)
     print(f"Reading {pak} (found via {source}{f', Steam build {build}' if build else ''})", file=sys.stderr)
+    args.usmap = args.usmap or default_usmap()
     if not args.usmap.is_file():
         raise SystemExit(f"usmap file not found: {args.usmap}")
+    print(f"Mappings: {args.usmap.name}", file=sys.stderr)
     command = ["dotnet", TOOL_DLL, "--pak", pak.resolve(), "--usmap", args.usmap.resolve(),
                "--game", args.game, "--out", args.out.resolve(), "--steps", ",".join(args.steps)]
     for character in args.character:
@@ -407,7 +522,8 @@ def main():
                                 help="one specific .pak file instead (overrides --game-dir)")
 
     add_game_args(export)
-    export.add_argument("--usmap", type=Path, default=DEFAULT_MAP, help=f"mappings file (default: {DEFAULT_MAP.name})")
+    export.add_argument("--usmap", type=Path,
+                        help="mappings file (default: the newest .usmap in the project root)")
     export.add_argument("--game", default="GAME_UE5_8", help="CUE4Parse game version (default: GAME_UE5_8)")
     export.add_argument("--out", type=Path, default=ROOT,
                         help="output root; files land in OUT/Rivals2/Content/Characters/... (default: project root)")
@@ -432,13 +548,21 @@ def main():
     find_game = sub.add_parser("find-game", help="show which game install/pak export would read")
     add_game_args(find_game)
 
+    usmap = sub.add_parser("usmap", help="generate a .usmap mappings file from the installed game's executable")
+    add_game_args(usmap)
+    usmap.add_argument("--out", type=Path, help="output file (default: Rivals2-build<Steam build>.usmap in the project root)")
+    usmap.add_argument("--usmapgen", help=f"usmapgen executable (default: {USMAPGEN_BIN.relative_to(ROOT)}, built by setup)")
+    usmap.add_argument("--compression", choices=("zstd", "brotli", "oodle", "none"),
+                       help="usmap compression (default: usmapgen's, zstd)")
+    usmap.add_argument("--overwrite", action="store_true", help="regenerate even if the file exists")
+
     args = parser.parse_args()
     if args.command == "export":
         bad = [s for s in args.steps if s not in STEPS]
         if bad:
             parser.error(f"unknown --steps value(s): {', '.join(bad)}")
     handler = {"setup": cmd_setup, "export": cmd_export, "check": cmd_check,
-               "find-game": cmd_find_game}[args.command]
+               "find-game": cmd_find_game, "usmap": cmd_usmap}[args.command]
     return handler(args) or 0
 
 

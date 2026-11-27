@@ -19,6 +19,7 @@ import argparse
 import ctypes
 import ctypes.util
 import functools
+import hashlib
 import json
 import math
 import re
@@ -391,6 +392,8 @@ class GLBCharacter:
         # Where Data/Palettes lives: the skin folder. Article meshes sit in a
         # subfolder (Skins/Default/ChainHand) but use the skin's palette.
         self.palette_dir = Path(palette_dir) if palette_dir else self.path.parent
+        # Every file the mesh's look depends on, for --changed-only renders.
+        self.dependencies = {self.path}
         raw = self.path.read_bytes()
         if raw[:4] != b"glTF":
             raise ValueError(f"{path} is not a binary glTF file")
@@ -468,6 +471,7 @@ class GLBCharacter:
             instance_path = next((CHARACTERS_ROOT.rglob(f"{material_name}.json")), None)
         if instance_path is None or not instance_path.is_file():
             raise ValueError(f"missing material instance properties {instance_path}")
+        self.dependencies.add(instance_path)
         instance = json.loads(instance_path.read_text(encoding="utf-8"))
         textures = instance.get("Textures", {})
         params = instance.get("Colors", {})
@@ -480,6 +484,7 @@ class GLBCharacter:
         mask_path = ROOT / f"{object_path}.png"
         if not mask_path.is_file():
             raise ValueError(f"missing color-region mask PNG {mask_path}")
+        self.dependencies.add(mask_path)
 
         mask = np.asarray(Image.open(mask_path).convert("RGB"), dtype=np.uint8)
         # CM RGB bits encode a one-based material color slot. The material
@@ -515,6 +520,7 @@ class GLBCharacter:
             instance_path = next((CHARACTERS_ROOT.rglob(f"{material_name}.json")), None)
         if instance_path is None or not instance_path.is_file():
             return None
+        self.dependencies.add(instance_path)
         instance = json.loads(instance_path.read_text(encoding="utf-8"))
         textures = instance.get("Textures", {})
         normal = textures.get("Normal") or textures.get("PM_Normals")
@@ -524,6 +530,7 @@ class GLBCharacter:
         normal_path = ROOT / f"{object_path}.png"
         if not normal_path.is_file():
             return None
+        self.dependencies.add(normal_path)
         return np.asarray(Image.open(normal_path).convert("RGB"), dtype=np.uint8)
 
     def read_skin_palette(self):
@@ -534,6 +541,7 @@ class GLBCharacter:
             palettes = self.palette_dir / "Data/Palettes"
             slot_assets = sorted(palettes.glob("*/CS_*.json")) if palettes.is_dir() else []
         for slot_path in slot_assets:
+            self.dependencies.add(slot_path)
             slot_data = json.loads(slot_path.read_text(encoding="utf-8"))
             slot_object = next((entry for entry in slot_data
                                 if entry.get("Name", "").startswith("Default__")), None)
@@ -544,6 +552,7 @@ class GLBCharacter:
             palette_path = ROOT / f"{asset_path}.json"
             if not palette_path.is_file():
                 continue
+            self.dependencies.add(palette_path)
             palette_data = json.loads(palette_path.read_text(encoding="utf-8"))
             palette_object = next((entry for entry in palette_data
                                    if entry.get("Name", "").startswith("Default__")), None)
@@ -1192,39 +1201,65 @@ def hitbox_box(attr, pose, previous_pose, indices, effects, to_world=None, missi
     puts hitboxes on a bone the skeleton lacks at the origin plus offset
     (articles without a skeleton use "Root"/"None").
     """
-    def point(bones, bone, offset):
-        found = bone_point(bones, indices, bone, offset)
-        if found is None and missing_bone_at_origin:
-            found = tuple(float(v) for v in offset)
+    def named(value):
+        return value if value and value != "None" else None
+
+    def point(bones, bone, offset, offset_bone=None):
+        """bone's position plus offset, measured in offset_bone's axes.
+
+        BoneName is the bone a hitbox follows; OffsetBoneName only says
+        whose axes its Offset uses ("Root" = the game's world axes, X
+        forward and Z up). E.g. Galvan DashGrab "Grab Bottom" is Shoulder_L
+        with Offset Z -50 in Root axes: 50 below the shoulder. Until
+        2026-11-26 OffsetBoneName was taken as the attach bone, which put
+        ~250 such hitboxes near the character origin (Absa Bair's sweetspot
+        in the middle of the body instead of at the foot).
+        """
+        offset_bone = named(offset_bone)
+        if offset_bone and offset_bone != bone:
+            base = bone_point(bones, indices, bone)
+            if base is None and missing_bone_at_origin:
+                base = (0.0, 0.0, 0.0)
+            if base is None:
+                return None
+            frame_index = indices.get(offset_bone)
+            if offset_bone == "Root" and "Root" not in indices:
+                frame_index = indices.get("Group")
+            rotation = bones[frame_index][1] if frame_index is not None else (0.0, 0.0, 0.0, 1.0)
+            moved = qrot(rotation, offset)
+            found = tuple(base[k] + moved[k] for k in range(3))
+        else:
+            found = bone_point(bones, indices, bone, offset)
+            if found is None and missing_bone_at_origin:
+                found = tuple(float(v) for v in offset)
         if found is not None and to_world:
             found = to_world(found)
         return found
 
-    attach = attr.get("OffsetBoneName")
-    if not attach or attach == "None":
-        attach = attr.get("BoneName", "")
-    center = point(pose, attach, vec(attr.get("Offset", {})))
+    attach = named(attr.get("BoneName")) or ""
+    offset_bone = attr.get("OffsetBoneName")
+    center = point(pose, attach, vec(attr.get("Offset", {})), offset_bone)
     if center is None:
         return None
     interpolation = str(attr.get("InitialInterpolationMode", "None")).split("::")[-1]
+    source_bone = named(attr.get("InitialInterpolationBoneName"))
+    source_offset = vec(attr.get("InitialInterpolationOffset", {}))
+    source_offset_bone = attr.get("InitialInterpolationOffsetBoneName")
     if interpolation == "Auto":
-        source_bone = attr.get("InitialInterpolationBoneName")
-        if not source_bone or source_bone == "None":
-            source_bone = attach
-        source_offset = attr.get("InitialInterpolationOffset", attr.get("Offset", {}))
-        start = point(previous_pose, source_bone, vec(source_offset))
+        # Sweep from where the hitbox itself was on the previous frame (all
+        # 224 Auto hitboxes name no interpolation bone).
+        if source_bone:
+            start = point(previous_pose, source_bone, source_offset, source_offset_bone)
+        else:
+            start = point(previous_pose, attach, vec(attr.get("Offset", {})), offset_bone)
     elif interpolation in ("Manual", "ManualPermanent"):
         # A capsule from InitialInterpolationBone + Offset to the hitbox.
         # ManualPermanent (100 hitboxes, e.g. the Clairen Dtilt sword and
         # tipper) is drawn this way in training mode.
         # UseCurrentFrameForInterpolation picks this frame's pose (a capsule
         # along the weapon) or the previous frame's (a sweep).
-        source_bone = attr.get("InitialInterpolationBoneName") or attach
-        if source_bone == "None":
-            source_bone = attach
-        source_offset = attr.get("InitialInterpolationOffset", {})
         source_pose = pose if attr.get("UseCurrentFrameForInterpolation") else previous_pose
-        start = point(source_pose, source_bone, vec(source_offset))
+        start = point(source_pose, source_bone or attach, source_offset, source_offset_bone)
     else:
         start = None
     shape = {"shape": "circle", "kind": "hit", "c": center}
@@ -2066,10 +2101,111 @@ def render_frame(image_path, move_name, frame, camera, show_skeleton=True, show_
     image.close()
 
 
+@functools.lru_cache(maxsize=None)
+def file_digest(path_string):
+    """Content hash of an input file. Re-exporting an unchanged pak writes
+    byte-identical files (checked on Loxodont, all 781 files), so only what
+    a game update really changed gets a new hash."""
+    path = Path(path_string)
+    if not path.is_file():
+        return "missing"
+    return hashlib.sha1(path.read_bytes()).hexdigest()
+
+
+# render_settings.json sections that don't change how a frame looks; edits
+# to them (or to "_" note keys) mustn't trigger a full re-render.
+SETTINGS_NOT_RENDERED = {"remote", "pipeline"}
+
+
+@functools.lru_cache(maxsize=1)
+def render_settings_digest():
+    def strip(node):
+        if isinstance(node, dict):
+            return {k: strip(v) for k, v in node.items() if not str(k).startswith("_")}
+        return [strip(v) for v in node] if isinstance(node, list) else node
+    used = {k: v for k, v in strip(SETTINGS).items() if k not in SETTINGS_NOT_RENDERED}
+    return hashlib.sha1(json.dumps(used, sort_keys=True).encode()).hexdigest()
+
+
+def move_inputs(attack, name, animation, character_mesh, options):
+    """Every input a move variant's output depends on -> content hash.
+
+    Keys are project-relative paths, plus a few pseudo-entries (renderer
+    code, settings, render options, this move's article rules). Used by
+    --changed-only to skip moves whose inputs are all unchanged.
+    """
+    files = {ATTACKS / f"{name}.json", SKELETON, CHARACTER_DATA, PHYSICS, animation}
+    props = attack.get("Properties", {}) or {}
+    rules = load_article_rules().get(name.casefold(), [])
+    article_paths = [(c.get("ArticleData") or {}).get("ObjectPath") for c in props.get("ArticleCreationData", []) or []]
+    article_paths += [find_article_path(rule["article"]) for rule in rules if "existing" in rule]
+    for object_path in filter(None, article_paths):
+        article = load_article(object_path)
+        files.add(asset_file(object_path, ".json"))
+        if not article:
+            continue
+        files.add(asset_file((article["props"].get("HurtboxesSkeletalMesh") or {}).get("ObjectPath"), ".json"))
+        if article["skeleton_path"]:
+            files.add(Path(article["skeleton_path"]))
+        for window in article["props"].get("Windows", []) or []:
+            files.add(asset_file((window.get("WindowAnimation") or {}).get("AssetPathName"), ".ueanim"))
+        if character_mesh:
+            mesh = article_mesh(object_path, str(CHAR), character_mesh.skin_textures)
+            if mesh:
+                files.update(mesh.dependencies)
+    if character_mesh:
+        files.update(character_mesh.dependencies)
+    inputs = {}
+    for path in files:
+        if not path:
+            continue
+        path = Path(path)
+        try:
+            key = str(path.resolve().relative_to(ROOT))
+        except ValueError:
+            key = str(path)
+        inputs[key] = file_digest(str(path.resolve()))
+    inputs["(renderer code)"] = file_digest(str(Path(__file__).resolve()))
+    inputs["(render_settings.json)"] = render_settings_digest()
+    inputs["(article rules for this move)"] = hashlib.sha1(json.dumps(rules, sort_keys=True).encode()).hexdigest()
+    inputs["(render options)"] = hashlib.sha1(json.dumps(options, sort_keys=True).encode()).hexdigest()
+    return inputs
+
+
+def changed_inputs(move_dir, inputs):
+    """None if move_dir was rendered from exactly these inputs and its PNGs
+    are all there; else a list saying what changed."""
+    record = move_dir / "render_inputs.json"
+    if not record.is_file():
+        return ["no previous render"]
+    try:
+        previous = json.loads(record.read_text(encoding="utf-8"))
+    except ValueError:
+        return ["unreadable render_inputs.json"]
+    old = previous.get("inputs", {})
+    changed = sorted(key for key in set(old) | set(inputs) if old.get(key) != inputs.get(key))
+    if changed:
+        return [Path(key).name if not key.startswith("(") else key for key in changed]
+    if len(list(move_dir.glob("*_HB_*.png"))) != previous.get("frames"):
+        return ["PNG files missing or extra"]
+    return None
+
+
 def export_variant(attack, name, variant, animation, ref_local, parents, indices, out_dir,
                    show_skeleton=True, show_character=False, character_mesh=None,
-                   camera_rotation=90):
+                   camera_rotation=90, changed_only=False):
+    """Render one move variant. Returns (folder, frame count, why): why is
+    None when --changed-only found nothing changed and kept the old frames,
+    else a list of reasons it was rendered."""
     move_dir = out_dir / f"{name}_{variant}"
+    options = {"variant": variant, "show_skeleton": show_skeleton, "show_character": show_character,
+               "skin_textures": bool(character_mesh and character_mesh.skin_textures),
+               "camera_rotation": camera_rotation}
+    inputs = move_inputs(attack, name, animation, character_mesh, options)
+    why = changed_inputs(move_dir, inputs) if changed_only else ["full render"]
+    if why is None:
+        previous = json.loads((move_dir / "render_inputs.json").read_text(encoding="utf-8"))
+        return move_dir, int(previous.get("frames", 0)), None
     articles = []
     frames = move_frames(attack, animation, ref_local, parents, indices, character_mesh, articles)
     camera = camera_for_frames(frames, camera_rotation)
@@ -2101,7 +2237,9 @@ def export_variant(attack, name, variant, animation, ref_local, parents, indices
             "frames": [{key: value for key, value in frame.items() if key != "character_mesh"}
                        for frame in frames]}
     (move_dir / "boxes.json").write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    return move_dir, len(frames)
+    (move_dir / "render_inputs.json").write_text(
+        json.dumps({"frames": len(frames), "inputs": inputs}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return move_dir, len(frames), why
 
 
 def main():
@@ -2111,6 +2249,10 @@ def main():
     parser.add_argument("--all", action="store_true", dest="all_characters",
                         help="process every character folder with attack and skeleton data")
     parser.add_argument("--move", help="one attack asset basename, e.g. ATT_Lox_Bair (default: all)")
+    parser.add_argument("--changed-only", action="store_true",
+                        help="only re-render moves whose inputs changed since their last render "
+                             "(game data, animations, articles, mesh/textures, settings, renderer code, "
+                             "options; recorded in each move folder's render_inputs.json)")
     parser.add_argument("--skip", action="append", default=[], metavar="REGEX",
                         help="skip attack assets whose name matches this case-insensitive regular "
                              "expression, e.g. --skip Intro --skip Taunt (repeatable)")
@@ -2200,7 +2342,8 @@ def main():
                     print(f"{character}: rendering mesh {glb_candidates[0].relative_to(ROOT)}")
                 except (OSError, ValueError, KeyError, IndexError) as exc:
                     raise SystemExit(f"Could not load character GLB {glb_candidates[0]}: {exc}") from exc
-        total_moves = total_frames = 0
+        total_moves = total_frames = unchanged_moves = unchanged_frames = 0
+        produced = set()
         needed_ueanim, missing_ueanim = set(), set()
         for path in paths:
             attack = load_attack(path)
@@ -2213,23 +2356,40 @@ def main():
                     needed_ueanim.add(anim_name + ".ueanim")
                     if not animation or animation.suffix.lower() != ".ueanim":
                         missing_ueanim.add(anim_name + ".ueanim")
-                move_dir, count = export_variant(attack, path.stem, variant, animation,
-                                                 ref_local, parents, indices, out_dir,
-                                                 args.show_skeleton, show_character,
-                                                 character_mesh, args.camera_rotation)
-                total_moves += 1
-                total_frames += count
+                move_dir, count, why = export_variant(attack, path.stem, variant, animation,
+                                                      ref_local, parents, indices, out_dir,
+                                                      args.show_skeleton, show_character,
+                                                      character_mesh, args.camera_rotation,
+                                                      args.changed_only)
+                produced.add(move_dir.name)
                 try:
                     display_path = move_dir.relative_to(ROOT)
                 except ValueError:
                     display_path = move_dir
+                if why is None:
+                    unchanged_moves += 1
+                    unchanged_frames += count
+                    print(f"{display_path}: {count} frames unchanged")
+                    continue
+                total_moves += 1
+                total_frames += count
+                if args.changed_only:
+                    print(f"{display_path}: re-rendered ({', '.join(why)})")
                 print(f"{display_path}: {count} frames")
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "required_animation_ueanim.txt").write_text(
             "\n".join(sorted(needed_ueanim)) + "\n", encoding="utf-8")
         missing_path = out_dir / "missing_animation_ueanim.txt"
         missing_path.write_text("\n".join(sorted(missing_ueanim)) + ("\n" if missing_ueanim else ""), encoding="utf-8")
-        print(f"{character}: rendered {total_frames} PNG frames across {total_moves} move variants to {out_dir}")
+        print(f"{character}: rendered {total_frames} PNG frames across {total_moves} move variants to {out_dir}"
+              + (f"; {unchanged_moves} unchanged ({unchanged_frames} frames kept)" if args.changed_only else ""))
+        # Move folders from earlier runs that this run didn't produce: moves a
+        # patch removed or renamed, or ones now skipped. Listed, not deleted.
+        if not args.move:
+            old = sorted(d.name for d in out_dir.iterdir()
+                         if d.is_dir() and d.name.startswith("ATT_") and d.name not in produced)
+            if old:
+                print(f"{character}: folders with no matching move this run: {', '.join(old)}")
         if not PHYSICS:
             print(f"{character}: no HB_*.json physics asset found; output will contain hitboxes and hurtbox-state events only")
         if missing_ueanim:

@@ -118,5 +118,13 @@
   "pipeline": {
     "default_skips": ["Intro", "Taunt", "_OLD$"],
     "_default_skips": "Moves run_pipeline.py skips unless --no-default-skips: case-insensitive regular expressions matched against the attack asset name (ATT_Lox_Intro). --skip REGEX adds more for one run."
+  },
+
+  "remote": {
+    "host": "smackers",
+    "dir": "~/projects/rivals2-render",
+    "python": "/opt/homebrew/bin/python3",
+    "jobs": null,
+    "_about": "run_remote_render.py renders on this SSH host (key login) in this folder; python creates its venv. jobs null = the remote CPU count minus 1. Flags --host, --remote-dir, --remote-python, --jobs override these."
   }
 }

@@ -213,7 +213,7 @@ The physics asset also has a `CollisionEnabled` flag (`QueryAndPhysics` / `NoCol
 
 Two JSON files in the project root hold everything meant to be edited by hand. The scripts read them on every run, so no code changes are needed:
 
-- **`render_settings.json`**:
+- **`render_settings.json`** (the `remote` and `pipeline` sections and `_` notes don't affect frames, so editing them doesn't trigger re-renders):
   - box colors, opacities and outline widths (`hitbox`, `hurtbox`, `skeleton`);
   - which on-hit effects count as tipper (`tipper_effects`);
   - how many frames past a move articles may extend it (`articles.extra_frames`);
@@ -295,14 +295,15 @@ Rivals 2 pipeline · 14.5s · step 2 of 3: render
 
 When the output goes to a file or a pipe, or with `--no-progress`, it prints plain lines instead. Ctrl+C stops the running renders, marks that step `interrupted`, and still writes the report.
 
-The steps, in order (`--steps` picks a comma list; the default is `export,check,render`):
+The steps, in order (`--steps` picks a comma list; the default is `usmap,export,check,render`):
 
 | Step | What it runs |
 |---|---|
 | `setup` | `export_characters_from_pak.py setup`. Added automatically if the exporter isn't built yet, or if `tools/pak_exporter/Program.cs` or its `.csproj` changed since the last build. List it yourself to force a rebuild. |
+| `usmap` | `export_characters_from_pak.py usmap`: if this Steam build has no `Rivals2-build<build>.usmap` yet, generate one from the game's executable. Skipped if `usmapgen` isn't built or `--usmap` is given. |
 | `export` | `export_characters_from_pak.py export` once per kind (`json`, `anims`, `meshes`, `textures`), so each one is timed separately. Existing files are **replaced**, because the point is to pick up the update. `--keep-existing` only fills in missing files. |
 | `check` | `export_characters_from_pak.py check`, the per-character input report |
-| `render` | `rivals2_move_boxes.py --character <C> --skin-textures` for each character with attacks and a skeleton. The textured default skin is drawn under the boxes; `--no-skin-textures` renders boxes only. |
+| `render` | `rivals2_move_boxes.py --character <C> --skin-textures --changed-only` for each character with attacks and a skeleton. Only moves whose inputs changed since their last render are re-rendered (see [Re-rendering only what changed](#re-rendering-only-what-changed)). The textured default skin is drawn under the boxes; `--no-skin-textures` renders boxes only. |
 | `gifs` | `make_attack_gif.py` for every rendered move folder (add with `--gifs` or `--steps ...,gifs`) |
 
 If `setup` or `export` fails outright, the pipeline stops, because later steps would use stale inputs. A per-file export failure (exporter exit code 3) is reported as `partial`, and the run continues.
@@ -310,23 +311,60 @@ If `setup` or `export` fails outright, the pipeline stops, because later steps w
 Flags:
 
 - `--game-dir DIR`: the Rivals 2 install folder, for installs Steam doesn't know about. By default the game is found through Steam (see [Where the pak is read from](#where-the-pak-is-read-from)), so after a Steam update you just re-run the pipeline. `--pak FILE` picks one specific pak instead.
-- `--usmap FILE`: the mappings file (default: the one in the project root). A game update that changes Unreal classes needs a new `.usmap`. The report's Steam build number tells you which update a run used.
+- `--usmap FILE`: use this mappings file and skip the `usmap` step. By default the newest `.usmap` in the project root is used, and the `usmap` step generates one for each new game build (see [Mappings (.usmap)](#mappings-usmap)). The report records which file a run used, next to the Steam build number.
 - `--character NAME`: limit every step to that character (repeatable; default all).
 - `--jobs N`: render or animate N characters in parallel (default 1). Each job is one Python process using one CPU core and about 400 MB of memory with skin textures. Use up to one less than your core count, e.g. `--jobs 7` on 8 cores. Timings for all of Loxodont (34 moves, 3424 frames, default skips) on an 8-core Linux machine, one job:
   - Textured (the default): 8m12s, about 7 frames per second. The roster is about 67,000 frames after the default skips, so about 2h40m on one job, or roughly half an hour with `--jobs 7` (an estimate; a parallel run hasn't been timed).
   - Boxes only (`--no-skin-textures`): 1m18s, about 44 frames per second, so about 25 minutes for the roster on one job.
 - Skipped moves: by default the render step skips intros, taunts and leftover `*_OLD` attack assets: 39 of the roster's 746 move variants, about 6% of the frames, almost all of it intros. The patterns are case-insensitive regular expressions matched against the attack asset name (`ATT_Lox_Intro`). `--skip REGEX` skips more (repeatable, e.g. `--skip Pummel`); `--no-default-skips` renders everything. The renderer takes the same `--skip` option directly. With `--clean`, folders of skipped moves from earlier runs are removed too.
 - `--skin-textures` / `--no-skin-textures`: draw the textured default skin under the boxes (default on). `--show-character` with `--no-skin-textures` draws the untextured mesh. Characters without an exported default mesh fall back to boxes only.
-- `--clean`: delete each character's old `Rivals2/HitboxFrames/<Character>` folder before rendering it. Without it, folders for moves a patch removed stay behind (frames inside a re-rendered move are always replaced).
+- `--full-render`: re-render every move and remake every GIF, even if nothing changed.
+- `--clean`: implies `--full-render`, and deletes each character's old `Rivals2/HitboxFrames/<Character>` folder before rendering it. Without it, folders for moves a patch removed stay behind (frames inside a re-rendered move are always replaced).
 - `--frames-out DIR`, `--gifs-out DIR`: output roots (default `Rivals2/HitboxFrames`, `Rivals2/GIFs`).
 - `--show-skeleton`, `--camera-rotation`: passed to `rivals2_move_boxes.py`.
 - `--gif-args=...`: extra `make_attack_gif.py` options as one string. Use the `=`, or the value is read as an option: `--gif-args=--no-dither`, `--gif-args='--format webm'`.
 - `--all-skins`: passed to the exporter.
 - `--report-dir DIR`: where the report goes. `--no-progress`: plain lines instead of the live display. `--verbose`: echo the exporter's output (implies `--no-progress`).
 
+### Rendering on another machine
+
+`run_remote_render.py` runs the render step on another computer over SSH, such as a Mac Studio, which renders this about 2–3× faster per core. Exporting stays on this machine, which has the game and `usmapgen`:
+
+```fish
+.venv/bin/python run_pipeline.py --steps usmap,export,check   # here: pick up a game update
+.venv/bin/python run_remote_render.py                         # there: render what changed
+```
+
+It runs four steps, each timed:
+1. **Push:** `rsync` sends the scripts, both settings files, the exported data (`Rivals2/Content/Characters`, about 1.3 GB) and your existing frames (about 5 GB), so the remote incremental check knows what's already rendered. After the first run, only changed files are sent.
+2. **Venv:** creates a NumPy/Pillow venv on the remote machine if it doesn't have a working one yet.
+3. **Render:** runs `run_pipeline.py --steps render` there, with its live progress shown in your terminal.
+4. **Pull:** copies the frames back, plus GIFs with `--gifs` and the run's report (`Rivals2/PipelineReports/<date_time>-remote/`). The report gets a "Remote run" section with the push, render and pull times.
+
+The host, remote folder, the Python used for its venv, and `jobs` (default: the remote CPU count minus 1) are in the `remote` section of `render_settings.json`. `--host`, `--remote-dir`, `--remote-python` and `--jobs` override them. Every other option (`--full-render`, `--clean`, `--character`, `--no-skin-textures`, `--skip`, ...) is passed to `run_pipeline.py`. `--no-push-frames` skips sending frames when the remote copy is already current.
+
+It needs `ssh` and `rsync` on this machine (Linux or macOS) and key-based SSH login to the other one. Ctrl+C stops the remote render cleanly and still pulls back the frames it finished; press it again to skip the pull. Frames rendered on the Mac are pixel-identical to the desktop's (checked on Zetterburn Fspecial), and their fingerprints match, so you can switch machines between runs without re-rendering.
+
+### Re-rendering only what changed
+
+Game updates often touch only a few moves, so the pipeline re-renders only moves whose inputs changed. Each move folder has a `render_inputs.json` with a content hash of everything that went into it:
+- the attack file and its animation;
+- the character's skeleton, `CD_` hurtbox data and `HB_` physics;
+- any articles the move spawns, with their skeletons, animations and meshes;
+- with `--skin-textures`, the mesh, its material files, textures and palette;
+- its `article_rules.json` entry, `render_settings.json`, the renderer code (`rivals2_move_boxes.py`) and the render options.
+
+On the next run, a move whose hashes all match keeps its PNGs; anything else is re-rendered. Re-exporting an unchanged pak writes byte-identical files, so the full update pipeline (`usmap`, `export` with `--overwrite`, `render`) only re-renders what the update really changed. Changing `render_settings.json` or the renderer code re-renders everything, because every frame depends on them.
+
+The report says what was re-rendered and why:
+- **"Re-rendered moves":** each move with the inputs that changed, e.g. `ATT_Wra_Fair.json`.
+- **"Old move folders":** folders no move produced this run, from moves a patch removed or renamed, or ones now skipped. They're left alone; delete them or use `--clean`.
+
+GIFs are remade only when their PNGs are newer than the GIF. `--full-render` (or `--clean`) does everything from scratch. `rivals2_move_boxes.py --changed-only` does the same check outside the pipeline.
+
 Each run writes `Rivals2/PipelineReports/<date_time>/`:
 
-- `report.md`: total and per-step times; per export kind, files written, skipped and failed; the `check` table; per character, render time, moves, frames, frames per second and missing animations; the 15 slowest moves; per-character animation counts.
+- `report.md`: total and per-step times; per export kind, files written, skipped and failed; the `check` table; per character, render time, moves, frames, frames per second and missing animations; **skipped moves** (each attack asset the skip patterns left out, the variants it accounts for, and the pattern that matched) and **missing animations** by name, so you can investigate them; the 15 slowest moves; per-character animation counts.
 - `report.json`: the same data, for scripts or comparing runs.
 - `logs/`: full output of every step and every character (`render_Loxodont.log`, `export_anims.log`, ...). The logs are line-buffered, so `tail -f` works during a run.
 
@@ -355,6 +393,19 @@ python export_characters_from_pak.py export --steps json,anims
 # Report which renderer inputs each character has or is missing.
 python export_characters_from_pak.py check
 ```
+
+### Mappings (.usmap)
+
+Unreal stores most properties without their names, so reading the pak needs a mappings file (`.usmap`) matching the game build. Without it, or with an outdated one, values come out wrong or as bare numbers. The original `Rivals2-5.8.0-0+UE5-5418fa4e.usmap` came from Kertic's GitHub project. It's already behind the current game: with it, some `WindowCancelType` values export as numbers (`ERivalsWindowCancelType::54`) or under shifted names.
+
+The tools can now make their own with [UsmapGen](https://github.com/Ka1serM/UsmapGen), which reads the game's executable **without running the game**. No injection is involved, unlike Dumper-7, so it can't crash the game or trip anti-cheat. Its source comes with CUE4Parse, and `setup` builds `tools/usmapgen/usmapgen` (Linux/macOS: needs `cmake`, `clang` and libc++; its tests, which download about 2 GB, are left out). On Windows, download `usmapgen.exe` from its releases page into `tools/usmapgen/`, or pass `--usmapgen PATH`.
+
+```bash
+python export_characters_from_pak.py usmap               # writes Rivals2-build<Steam build>.usmap in the project root
+python export_characters_from_pak.py usmap --overwrite   # regenerate
+```
+
+`export` (and the pipeline) uses the newest `.usmap` in the project root unless `--usmap` says otherwise. The pipeline's `usmap` step generates one automatically after each game update. The generated file is checked: exported with it, every value the renderer reads (attacks, articles, hurtboxes, skeletons) matched the old file's for Loxodont, Clairen, Galvan and Absa, apart from name casing. It differed only in the enum names that the old file had wrong.
 
 ### Where the pak is read from
 

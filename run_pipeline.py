@@ -6,12 +6,17 @@ Runs these steps in order (pick a subset with --steps):
   setup    Build the pak exporter. Runs automatically if it isn't built yet
            or its source is newer than the build; list it in --steps to force
            a rebuild (e.g. after a CUE4Parse bump).
+  usmap    Generate Rivals2-build<Steam build>.usmap from the game's executable
+           with UsmapGen if this game build has none yet (skipped if usmapgen
+           isn't built or --usmap is given). export uses the newest .usmap.
   export   Export json, anims, meshes, textures from the pak, one exporter run
            per kind so each one is timed separately. Existing files are
            REPLACED by default, since the point is picking up a pak update
            (--keep-existing to only fill in missing files).
   check    The exporter's per-character input report (missing anims, ...).
-  render   rivals2_move_boxes.py once per character, --jobs at a time, with
+  render   rivals2_move_boxes.py once per character, --jobs at a time. Only
+           moves whose inputs changed since their last render are re-rendered
+           (--full-render or --clean renders everything). Renders with
            --skin-textures (the textured default skin under the boxes) unless
            --no-skin-textures. Intros, taunts and *_OLD assets are skipped
            (--no-default-skips renders them; --skip REGEX skips more).
@@ -66,8 +71,8 @@ CHARACTERS = ROOT / "Rivals2/Content/Characters"
 DEFAULT_FRAMES = ROOT / "Rivals2/HitboxFrames"
 DEFAULT_GIFS = ROOT / "Rivals2/GIFs"
 DEFAULT_REPORTS = ROOT / "Rivals2/PipelineReports"
-ALL_STEPS = ("setup", "export", "check", "render", "gifs")
-DEFAULT_STEPS = ("export", "check", "render")
+ALL_STEPS = ("setup", "usmap", "export", "check", "render", "gifs")
+DEFAULT_STEPS = ("usmap", "export", "check", "render")
 EXPORT_KINDS = exporter.STEPS  # json, anims, meshes, textures
 EXPORTER_SOURCES = (exporter.TOOL_DIR / "Program.cs", exporter.TOOL_PROJECT)
 # Moves the render step skips unless --no-default-skips: regular expressions
@@ -362,6 +367,33 @@ def skipped(stem, patterns):
     return any(re.search(pattern, stem, re.IGNORECASE) for pattern in patterns)
 
 
+def skipped_moves(character, patterns):
+    """Attack assets the render step skips for a character, with the pattern
+    that matched each, for the report."""
+    rows = []
+    for path in sorted((CHARACTERS / character / "Attacks").glob("ATT_*.json")):
+        pattern = next((p for p in patterns if re.search(p, path.stem, re.IGNORECASE)), None)
+        if pattern:
+            rows.append({"move": path.stem, "pattern": pattern, "variants": count_move_variants_for(path)})
+    return rows
+
+
+def count_move_variants_for(path):
+    """Variants (folders) one attack asset would render: see count_move_variants."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    attack = next((e for e in data if str(e.get("Type", "")).startswith("ATT_")), None)
+    if not attack:
+        return 0
+    props = attack.get("Properties", {}) or {}
+    refs = [key for key in ("GroundedAnimation", "AerialAnimation")
+            if isinstance(props.get(key), dict)
+            and props[key].get("ObjectPath", "").rsplit("/", 1)[-1].split(".", 1)[0]]
+    return len(refs) or 1
+
+
 def count_move_variants(character, skips=()):
     """How many move folders rivals2_move_boxes.py will write for a character.
 
@@ -369,23 +401,9 @@ def count_move_variants(character, skips=()):
     per Grounded/Aerial animation reference, or one "Default" variant.
     Attack assets matching a --skip pattern are left out, as the renderer does.
     """
-    total = 0
-    for path in sorted((CHARACTERS / character / "Attacks").glob("ATT_*.json")):
-        if skipped(path.stem, skips):
-            continue
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        attack = next((e for e in data if str(e.get("Type", "")).startswith("ATT_")), None)
-        if not attack:
-            continue
-        props = attack.get("Properties", {}) or {}
-        refs = [key for key in ("GroundedAnimation", "AerialAnimation")
-                if isinstance(props.get(key), dict)
-                and props[key].get("ObjectPath", "").rsplit("/", 1)[-1].split(".", 1)[0]]
-        total += len(refs) or 1
-    return total
+    return sum(count_move_variants_for(path)
+               for path in sorted((CHARACTERS / character / "Attacks").glob("ATT_*.json"))
+               if not skipped(path.stem, skips))
 
 
 def exporter_needs_build():
@@ -422,12 +440,30 @@ PHASES = {"write": ("packages", "writing json"), "load": ("packages", "reading p
           "export": ("objects", "converting")}
 
 
+def step_usmap(args, report, logs):
+    """Generate a .usmap for the installed game build if there isn't one yet."""
+    if args.usmap:
+        return {"status": "skipped", "seconds": 0, "note": f"using --usmap {relative(args.usmap)}"}
+    if not exporter.USMAPGEN_BIN.is_file():
+        return {"status": "skipped", "seconds": 0,
+                "note": f"usmapgen not built (setup builds it); using {exporter.default_usmap().name}"}
+    DISPLAY.task("usmapgen", detail="reading the game executable")
+    log = logs / "usmap.log"
+    code, seconds = run_logged([PYTHON, "export_characters_from_pak.py", "usmap", "--pak", args.resolved_pak],
+                               log, echo=True)
+    DISPLAY.task_finished("usmapgen", f"usmap exited {code}")
+    chosen = exporter.default_usmap()
+    report["usmap"] = file_info(chosen)
+    return {"status": "ok" if code == 0 else "failed", "seconds": seconds, "exit_code": code,
+            "log": relative(log), "note": f"mappings: {chosen.name}"}
+
+
 def step_export(args, report, logs):
     kinds = []
     DISPLAY.set_bar(0, len(EXPORT_KINDS), "kinds", eta=False)  # kinds take very different times
     for index, kind in enumerate(EXPORT_KINDS):
         command = [PYTHON, "export_characters_from_pak.py", "export", "--steps", kind, "--no-check",
-                   "--progress", "--pak", args.resolved_pak, "--usmap", args.usmap]
+                   "--progress", "--pak", args.resolved_pak, "--usmap", args.usmap or exporter.default_usmap()]
         for character in args.character:
             command += ["--character", character]
         if not args.keep_existing:
@@ -504,8 +540,11 @@ def step_check(args, report, logs):
                      if noted else f"{plural(len(problems), 'character')}, all inputs present")}
 
 
-MOVE_LINE = re.compile(r"^(?P<path>.+): (?P<frames>\d+) frames$")
+MOVE_LINE = re.compile(r"^(?P<path>.+): (?P<frames>\d+) frames(?P<unchanged> unchanged)?$")
+WHY_LINE = re.compile(r"^(?P<path>.+): re-rendered \((?P<why>.*)\)$")
 CHAR_TOTAL = re.compile(r": rendered (\d+) PNG frames across (\d+) move variants")
+UNCHANGED_TOTAL = re.compile(r"; (\d+) unchanged \((\d+) frames kept\)")
+OLD_FOLDERS = re.compile(r": folders with no matching move this run: (.*)$")
 
 
 class Counter:
@@ -531,26 +570,47 @@ def render_one(character, args, logs, out_root, totals, counter):
         command.append("--skin-textures")  # implies --show-character
     elif args.show_character:
         command.append("--show-character")
+    if not args.full_render:
+        command.append("--changed-only")
     moves, last = [], [0.0]
-    summary = {}
+    summary = {"unchanged": 0, "unchanged_frames": 0, "rerendered": [], "old_folders": []}
+    reasons = {}
+    seen = [0]
     DISPLAY.task(character, done=0, total=totals[character], unit="moves", detail="loading")
 
     def on_line(line, t):
+        match = WHY_LINE.match(line)
+        if match:
+            reasons[Path(match["path"]).name] = match["why"]
+            return
         match = MOVE_LINE.match(line)
         if match:
             frames = int(match["frames"])
-            moves.append({"move": Path(match["path"]).name, "frames": frames,
-                          "seconds": round(t - last[0], 2)})
+            move = Path(match["path"]).name
+            seen[0] += 1
+            if match["unchanged"]:
+                detail = f"{move} unchanged"
+            else:
+                moves.append({"move": move, "frames": frames, "seconds": round(t - last[0], 2)})
+                if move in reasons:
+                    summary["rerendered"].append({"move": move, "why": reasons[move]})
+                detail = f"{move} ({frames} frames)"
+                with counter.lock:
+                    counter.frames += frames
             last[0] = t
-            DISPLAY.task(character, done=len(moves), total=max(totals[character], len(moves)),
-                         detail=f"{Path(match['path']).name} ({frames} frames)")
+            DISPLAY.task(character, done=seen[0], total=max(totals[character], seen[0]), detail=detail)
             with counter.lock:
                 counter.units_done += 1
-                counter.frames += frames
             update_render_bar(counter)
         match = CHAR_TOTAL.search(line)
         if match:
             summary["frames"], summary["moves"] = int(match.group(1)), int(match.group(2))
+        match = UNCHANGED_TOTAL.search(line)
+        if match:
+            summary["unchanged"], summary["unchanged_frames"] = int(match.group(1)), int(match.group(2))
+        match = OLD_FOLDERS.search(line)
+        if match:
+            summary["old_folders"] = [name.strip() for name in match.group(1).split(",")]
 
     log = logs / f"render_{character}.log"
     code, seconds = run_logged(command, log, on_line=on_line)
@@ -561,15 +621,19 @@ def render_one(character, args, logs, out_root, totals, counter):
     row = {"character": character, "status": status, "exit_code": code,
            "seconds": seconds, "moves": summary.get("moves", len(moves)),
            "frames": summary.get("frames", sum(m["frames"] for m in moves)),
-           "missing_anims": len(missing), "move_times": moves, "log": relative(log),
+           "unchanged": summary["unchanged"], "unchanged_frames": summary["unchanged_frames"],
+           "rerendered": summary["rerendered"], "old_folders": summary["old_folders"],
+           "missing_anims": len(missing), "missing_anim_names": missing,
+           "move_times": moves, "log": relative(log),
            "out": relative(out_dir)}
     with counter.lock:
         counter.done_characters += 1
         # Keep the ETA honest when the count was off (e.g. a crash mid-character).
-        counter.units_done += totals[character] - len(moves) if code == 0 else 0
+        counter.units_done += totals[character] - seen[0] if code == 0 else 0
     update_render_bar(counter)
     DISPLAY.task_finished(character, f"{character}: {row['status']} in {fmt_time(seconds)} "
-                                     f"({row['frames']} frames, {row['moves']} moves)")
+                                     f"({row['frames']} frames, {row['moves']} moves"
+                                     + (f", {row['unchanged']} unchanged" if row["unchanged"] else "") + ")")
     if code != 0 and not INTERRUPTED.is_set():
         say(f"{character}: renderer exited with code {code}; see {row['log']}")
     return row
@@ -608,7 +672,8 @@ def step_render(args, report, logs):
     totals = {c: count_move_variants(c, args.skips) for c in characters}
     counter = Counter(characters, sum(totals.values()))
     update_render_bar(counter)
-    skipped_moves = sum(count_move_variants(c) for c in characters) - counter.units_total
+    skipped = {c: skipped_moves(c, args.skips) for c in characters}
+    skipped_count = sum(row["variants"] for rows in skipped.values() for row in rows)
     if not DISPLAY.live:
         say(f"  rendering {plural(len(characters), 'character')} ({counter.units_total} moves), "
             f"{args.jobs} at a time -> {relative(args.frames_out)}")
@@ -618,10 +683,14 @@ def step_render(args, report, logs):
     failed = [r["character"] for r in rows if r["status"] != "ok"]
     frames = sum(r["frames"] for r in rows)
     note = f"{frames:,} frames, {sum(r['moves'] for r in rows)} moves"
-    if skipped_moves:
-        note += f" ({skipped_moves} skipped)"
+    unchanged = sum(r["unchanged"] for r in rows)
+    if not args.full_render:
+        note = f"{sum(r['moves'] for r in rows)} moves re-rendered ({frames:,} frames), {unchanged} unchanged"
+    if skipped_count:
+        note += f" ({skipped_count} skipped, listed in the report)"
     return {"status": "failed" if failed else "ok", "seconds": time.monotonic() - start,
-            "characters": rows, "skips": list(args.skips), "skipped_moves": skipped_moves,
+            "characters": rows, "skips": list(args.skips), "skipped_moves": skipped_count,
+            "skipped": {c: rows for c, rows in skipped.items() if rows},
             "note": note + (f"; failed: {', '.join(failed)}" if failed else "")}
 
 
@@ -638,14 +707,24 @@ def gifs_one(character, args, logs, totals, counter):
     suffix = {"apng": ".png", "webm": ".webm"}.get(next(
         (extra[i + 1] for i, a in enumerate(extra[:-1]) if a == "--format"), "gif"), ".gif")
     log = logs / f"gifs_{character}.log"
-    created = failed = 0
+    created = failed = skipped_gifs = 0
     start = time.monotonic()
     log.parent.mkdir(parents=True, exist_ok=True)
     DISPLAY.task(character, done=0, total=len(move_dirs), unit="moves", detail="")
     with open(log, "w", encoding="utf-8") as handle:
         for done, move_dir in enumerate(move_dirs, 1):
             out_dir.mkdir(parents=True, exist_ok=True)
-            command = [PYTHON, "make_attack_gif.py", move_dir, "--out", out_dir / (move_dir.name + suffix), *extra]
+            destination = out_dir / (move_dir.name + suffix)
+            newest_png = max((p.stat().st_mtime for p in move_dir.glob("*.png")), default=0)
+            if (not args.full_render and destination.is_file()
+                    and destination.stat().st_mtime >= newest_png):
+                skipped_gifs += 1  # its frames haven't been re-rendered since
+                DISPLAY.task(character, done=done, detail=f"{move_dir.name} unchanged")
+                with counter.lock:
+                    counter.units_done += 1
+                update_gif_bar(counter)
+                continue
+            command = [PYTHON, "make_attack_gif.py", move_dir, "--out", destination, *extra]
             result = subprocess.run([str(c) for c in command], cwd=ROOT, capture_output=True,
                                     text=True, encoding="utf-8", errors="replace")
             handle.write(f"$ {shlex.join(str(c) for c in command)}\n{result.stdout}{result.stderr}\n")
@@ -660,10 +739,10 @@ def gifs_one(character, args, logs, totals, counter):
     with counter.lock:
         counter.done_characters += 1
     update_gif_bar(counter)
-    DISPLAY.task_finished(character, f"{character}: {created} created, {failed} failed "
+    DISPLAY.task_finished(character, f"{character}: {created} created, {skipped_gifs} unchanged, {failed} failed "
                                      f"in {fmt_time(time.monotonic() - start)}")
     return {"character": character, "status": "ok" if not failed else "failed",
-            "seconds": time.monotonic() - start, "created": created, "failed": failed,
+            "seconds": time.monotonic() - start, "created": created, "failed": failed, "unchanged": skipped_gifs,
             "log": relative(log), "out": relative(out_dir)}
 
 
@@ -694,7 +773,7 @@ def step_gifs(args, report, logs):
             "characters": rows, "note": note}
 
 
-STEP_FUNCS = {"setup": step_setup, "export": step_export, "check": step_check,
+STEP_FUNCS = {"setup": step_setup, "usmap": step_usmap, "export": step_export, "check": step_check,
               "render": step_render, "gifs": step_gifs}
 
 
@@ -721,13 +800,16 @@ def write_report(report, report_dir):
     out.append(f"- **Total time:** {fmt_time(report.get('seconds'))}")
     out.append(f"- **Finished:** {report.get('finished', '-')}")
     out.append(f"- **Command:** `{report['command']}`")
-    out.append(f"- **Pak:** {report['pak']['path']}" + (
-        f" ({report['pak']['size_gb']} GB, modified {report['pak']['modified']})"
-        if report['pak'].get('exists') else " (missing)"))
-    if report["pak"].get("found_via"):
-        out.append(f"- **Found via:** {report['pak']['found_via']}"
-                   + (f", Steam build {report['pak']['steam_build']}" if report["pak"].get("steam_build") else ""))
-    out.append(f"- **Mappings:** {report['usmap']['path']}")
+    if {"usmap", "export"} & set(report.get("steps_requested", [])):
+        out.append(f"- **Pak:** {report['pak']['path']}" + (
+            f" ({report['pak']['size_gb']} GB, modified {report['pak']['modified']})"
+            if report['pak'].get('exists') else " (missing)"))
+        if report["pak"].get("found_via"):
+            out.append(f"- **Found via:** {report['pak']['found_via']}"
+                       + (f", Steam build {report['pak']['steam_build']}" if report["pak"].get("steam_build") else ""))
+        out.append(f"- **Mappings:** {report['usmap']['path']}")
+    else:
+        out.append("- **Game data:** already exported (this run didn't read the pak)")
     out.append(f"- **Host:** {report['host']}")
     out.append("")
     out.append("## Steps")
@@ -748,14 +830,45 @@ def write_report(report, report_dir):
     if render and render.get("characters"):
         rows = render["characters"]
         out += ["", "## Render", "",
-                md_table(["character", "status", "time", "moves", "frames", "frames/s",
-                          "missing anims", "log"],
+                md_table(["character", "status", "time", "moves rendered", "frames", "frames/s",
+                          "unchanged", "missing anims", "log"],
                          [(r["character"], r["status"], fmt_time(r["seconds"]), r["moves"], r["frames"],
-                           f"{r['frames'] / r['seconds']:.1f}" if r["seconds"] else "-",
-                           r["missing_anims"], r["log"]) for r in rows])]
+                           f"{r['frames'] / r['seconds']:.1f}" if r["seconds"] and r["frames"] else "-",
+                           r.get("unchanged", 0), r["missing_anims"], r["log"]) for r in rows])]
         out.append("")
         out.append(f"Totals: {sum(r['moves'] for r in rows)} moves, {sum(r['frames'] for r in rows)} frames. "
                    "Character times are wall-clock; with --jobs above 1 they overlap.")
+        rerendered = [(r["character"], m["move"], m["why"]) for r in rows for m in r.get("rerendered", [])]
+        if rerendered:
+            first_time = [row for row in rerendered if row[2] == "no previous render"]
+            out += ["", "### Re-rendered moves", "",
+                    "Moves whose inputs changed since their last render (`render_inputs.json` in each move folder), "
+                    "and what changed:", ""]
+            listed = [row for row in rerendered if row[2] != "no previous render"]
+            if listed:
+                out.append(md_table(["character", "move", "changed"], listed))
+            if first_time:
+                out += ["", f"{len(first_time)} moves had no previous render and were rendered for the first time."]
+        old = [(r["character"], name) for r in rows for name in r.get("old_folders", [])]
+        if old:
+            out += ["", "### Old move folders", "",
+                    "Folders in the output that no move produced this run: moves a patch removed or renamed, "
+                    "or moves now skipped. They were left alone; delete them or run with `--clean`.", "",
+                    md_table(["character", "folder"], old)]
+        if render.get("skipped"):
+            out += ["", "### Skipped moves", "",
+                    f"Not rendered because their names match a skip pattern ({', '.join(f'`{p}`' for p in render.get('skips', []))}; "
+                    "`--no-default-skips` renders them, `pipeline.default_skips` in render_settings.json sets the list):", "",
+                    md_table(["character", "attack asset", "variants", "matched"],
+                             [(c, m["move"], m["variants"], f"`{m['pattern']}`")
+                              for c, moves in render["skipped"].items() for m in moves])]
+        missing = [(r["character"], name) for r in rows for name in r.get("missing_anim_names", [])]
+        if missing:
+            out += ["", "### Missing animations", "",
+                    "These .ueanim files are referenced by attacks but weren't found, so those moves were "
+                    "rendered in the reference pose. Re-export (`export --steps anims`) or check the character "
+                    "folder; a reference to another character's animation also shows up here.", "",
+                    md_table(["character", "animation"], missing)]
         slow = sorted(((m, r["character"]) for r in rows for m in r["move_times"]),
                       key=lambda x: x[0]["seconds"], reverse=True)[:15]
         if slow:
@@ -765,9 +878,9 @@ def write_report(report, report_dir):
     gifs = report["steps"].get("gifs")
     if gifs and gifs.get("characters"):
         out += ["", "## Animations", "",
-                md_table(["character", "status", "time", "created", "failed", "log"],
-                         [(r["character"], r["status"], fmt_time(r["seconds"]), r["created"], r["failed"],
-                           r["log"]) for r in gifs["characters"]])]
+                md_table(["character", "status", "time", "created", "unchanged", "failed", "log"],
+                         [(r["character"], r["status"], fmt_time(r["seconds"]), r["created"],
+                           r.get("unchanged", 0), r["failed"], r["log"]) for r in gifs["characters"]])]
     (report_dir / "report.md").write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
@@ -795,14 +908,18 @@ def main():
                        help=f"Rivals 2 install folder (default: ${exporter.GAME_DIR_ENV}, else found through Steam)")
     group.add_argument("--pak", type=Path,
                        help="one specific .pak file instead (overrides --game-dir)")
-    group.add_argument("--usmap", type=Path, default=exporter.DEFAULT_MAP,
-                       help=f"mappings file (default: {exporter.DEFAULT_MAP.name})")
+    group.add_argument("--usmap", type=Path,
+                       help="mappings file (default: the newest .usmap in the project root; the usmap step generates one per game build)")
     group.add_argument("--keep-existing", action="store_true",
                        help="skip files already on disk instead of replacing them")
     group.add_argument("--all-skins", action="store_true", help="also export non-default skins")
     group = parser.add_argument_group("render (passed to rivals2_move_boxes.py)")
     group.add_argument("--frames-out", type=Path, default=DEFAULT_FRAMES,
                        help=f"frame output root (default: {relative(DEFAULT_FRAMES)})")
+    group.add_argument("--full-render", action="store_true",
+                       help="re-render every move (and remake every GIF). By default only moves whose "
+                            "inputs changed are re-rendered: game data, animations, articles, mesh and "
+                            "textures, render_settings.json, article rules, renderer code or options")
     group.add_argument("--clean", action="store_true",
                        help="delete each character's old frame folder before rendering, so moves "
                             "removed by a patch don't linger")
@@ -835,6 +952,7 @@ def main():
     args = parser.parse_args()
 
     args.skips = ([] if args.no_default_skips else list(DEFAULT_SKIPS)) + args.skip
+    args.full_render = args.full_render or args.clean  # --clean deletes the old frames anyway
     steps = list(args.steps) + (["gifs"] if args.gifs and "gifs" not in args.steps else [])
     notices = []
     if "export" in steps and "setup" not in steps:
@@ -842,6 +960,8 @@ def main():
         if reason:
             notices.append(f"{reason}; adding the setup step.")
             steps.insert(0, "setup")
+    if "export" not in steps and "usmap" in steps and "usmap" not in args.steps:
+        steps.remove("usmap")
     steps = [s for s in ALL_STEPS if s in steps]  # always run in pipeline order
     if args.clean:
         frames_root = args.frames_out.resolve()
@@ -857,7 +977,7 @@ def main():
         pak_info = dict(file_info(args.resolved_pak), found_via=source, steam_build=build,
                         path=str(args.resolved_pak))
     except SystemExit as exc:
-        if "export" in steps:
+        if "export" in steps or "usmap" in steps:
             parser.error(str(exc))
 
     started = datetime.now()
@@ -866,7 +986,7 @@ def main():
     logs.mkdir(parents=True, exist_ok=True)
     report = {"started": started.isoformat(timespec="seconds"), "status": "running",
               "command": shlex.join(["python", *sys.argv]), "steps_requested": steps,
-              "pak": pak_info, "usmap": file_info(args.usmap),
+              "pak": pak_info, "usmap": file_info(args.usmap or exporter.default_usmap()),
               "host": f"{platform.system()} {platform.machine()}, {os.cpu_count()} CPUs, "
                       f"Python {platform.python_version()}", "steps": {}}
 
